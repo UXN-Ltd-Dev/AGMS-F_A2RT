@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<configuration xmlns:xs="http:/www.w3.org/2001/XMLSchema-instance">
+  <packages/>
+  <device Dclock="48000000" Dcore="Cortex-M33" DcoreVersion="r0p4" Ddsp="DSP" Dendian="Little-endian" Dfamily="RSL15 Series" Dfpu="SP_FPU" Dmpu="MPU" Dname="RSL15" Dsecure="Non-secure" Dtz="TZ" Dvendor="ONSemiconductor:141" info="ARM , 64 KB RAM" url="https:/www.keil.com/dd2/onsemi/rsl15">
+    <package info="ON Semiconductor RSL15 Device Pack" name="RSL15" url="www.onsemi.com/" vendor="ONSemiconductor" version="1.11.339"/>
+  </device>
+  <toolchain Tcompiler="GCC" Toutput="exe"/>
+  <board Bname="CEM102 Evaluation Board" Brevision="" Bvendor="ONSemiconductor" url="https://www.keil.com/boards2/onsemi/cem102evaluationboard">
+    <package info="ON Semiconductor CEM102 CMSIS-Pack" name="CEM102" url="www.onsemi.com/" vendor="ONSemiconductor" version="1.5.1-857"/>
+  </board>
+  <components>
+    <component Cclass="CEM102" Cgroup="CEM102_Driver" Csub="CEM102_Driver" Cvariant="source" Cvendor="ONSemiconductor" Cversion="1.5.1-857" deviceDependent="1">
+      <package name="CEM102" url="www.onsemi.com/" vendor="ONSemiconductor" version="1.5.1-857"/>
+      <file category="doc" deviceDependent="1" name="documentation/CEM102_documentation/cem102_hw_user_manual.pdf"/>
+      <file category="include" deviceDependent="1" name="firmware/include/"/>
+      <file attr="config" category="header" deviceDependent="1" name="firmware/source/lib/drivers/cem102_driver/include/cem102_common.h" version="1.0.0"/>
+      <file attr="config" category="header" deviceDependent="1" name="firmware/source/lib/drivers/cem102_driver/include/cem102_driver.h" version="1.0.0"/>
+      <file attr="config" category="header" deviceDependent="1" name="firmware/source/lib/drivers/cem102_driver/include/Driver_CEM102.h" version="1.0.0"/>
+      <file attr="config" category="source" deviceDependent="1" name="firmware/source/lib/drivers/cem102_driver/code/cem102_driver.c" version="1.0.0"/>
+      <file attr="config" category="source" deviceDependent="1" name="firmware/source/lib/drivers/cem102_driver/code/cem102_driver_dac.c" version="1.0.0"/>
+      <file attr="config" category="source" deviceDependent="1" name="firmware/source/lib/drivers/cem102_driver/code/cem102_driver_power.c" version="1.0.0"/>
+      <file attr="config" category="source" deviceDependent="1" name="firmware/source/lib/drivers/cem102_driver/code/cem102_driver_signal.c" version="1.0.0"/>
+      <file attr="config" category="source" deviceDependent="1" name="firmware/source/lib/drivers/cem102_driver/code/cem102_driver_system.c" version="1.0.0"/>
+    </component>
+    <component Capiversion="1.0.0" Cclass="Device" Cgroup="Bluetooth Core" Csub="BLE Abstraction" Cvendor="ONSemiconductor" Cversion="1.11.339" deviceDependent="1">
+      <package name="RSL15" url="www.onsemi.com/" vendor="ONSemiconductor" version="1.11.339"/>
+      <file category="doc" deviceDependent="1" name="documentation/RSL15_html/RSL15_html.htm"/>
+      <file category="header" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/include/ble_abstraction.h" version="1.0.0"/>
+      <file category="header" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/include/ble_gap.h" version="1.0.0"/>
+      <file category="header" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/include/ble_gatt.h" version="1.0.0"/>
+      <file category="header" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/include/msg_handler.h" version="1.0.0"/>
+      <file category="header" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/include/bondlist.h" version="1.0.0"/>
+      <file category="header" condition="BASS_Profile_Condition" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_profiles/include/ble_bass.h" version="1.0.0"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/source/stubprf.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/source/ble_gap.c" version="1.0.0"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/source/ble_gatt.c" version="1.0.0"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/source/msg_handler.c" version="1.0.0"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/source/bondlist.c" version="1.0.0"/>
+      <file category="source" condition="BASS_Profile_Condition" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_profiles/source/ble_bass.c" version="1.0.0"/>
+      <file attr="config" category="source" condition="Not_FOTA_Condition" deviceDependent="1" name="firmware/source/lib/ble_abstraction/ble_common/source/ble_protocol_support.c" version="1.0.0"/>
+    </component>
+    <component Capiversion="1.0.0" Cclass="Device" Cgroup="Bluetooth Core" Csub="BLE Stack" Cvariant="release" Cvendor="ONSemiconductor" Cversion="1.11.339" deviceDependent="1">
+      <package name="RSL15" url="www.onsemi.com/" vendor="ONSemiconductor" version="1.11.339"/>
+      <file category="doc" deviceDependent="1" name="documentation/RSL15_html/RSL15_html.htm"/>
+      <file category="library" deviceDependent="1" name="lib/ble_core/Release/libblelib.a"/>
+    </component>
+    <component Cclass="Device" Cgroup="Bluetooth Profiles" Csub="BASS" Cvariant="release" Cvendor="ONSemiconductor" Cversion="1.11.339" deviceDependent="1">
+      <package name="RSL15" url="www.onsemi.com/" vendor="ONSemiconductor" version="1.11.339"/>
+      <file category="doc" deviceDependent="1" name="documentation/ceva/RW-BLE-PRF-BAS-IS.pdf"/>
+      <file category="library" deviceDependent="1" name="lib/ble_profiles/Release/libbass.a"/>
+    </component>
+    <component Cclass="Device" Cgroup="Libraries" Csub="HAL" Cvariant="source" Cvendor="ONSemiconductor" Cversion="1.11.339" deviceDependent="1">
+      <package name="RSL15" url="www.onsemi.com/" vendor="ONSemiconductor" version="1.11.339"/>
+      <file category="doc" deviceDependent="1" name="documentation/RSL15_html/RSL15_html.htm"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/clock.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/lowpower_clock.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/sassert.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/flash_copier.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/trim.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/uart.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/lsad.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/os_systick.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/rffe.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/power_modes.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/power_modes_legacy.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/sar_adc.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/temperature_sensor.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/HAL/source/thermistor.c"/>
+      <file category="source" condition="GCC_ARMCC_Condition" deviceDependent="1" name="firmware/source/lib/HAL/source/go_to_sleep_asm.S"/>
+      <file category="source" condition="GCC_ARMCC_Condition" deviceDependent="1" name="firmware/source/lib/HAL/source/acs_write_asm.S"/>
+    </component>
+    <component Cclass="Device" Cgroup="Libraries" Csub="SwmTrace" Cvariant="swmTrace_UART_NB_Source" Cvendor="ONSemiconductor" Cversion="1.11.339" deviceDependent="1">
+      <package name="RSL15" url="www.onsemi.com/" vendor="ONSemiconductor" version="1.11.339"/>
+      <file category="doc" deviceDependent="1" name="documentation/RSL15_html/RSL15_html.htm"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/swmTrace/source/swmTrace.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/swmTrace/source/uart_common/uart_common.c"/>
+      <file category="source" deviceDependent="1" name="firmware/source/lib/swmTrace/source/uart/swmTrace_wrapper.c"/>
+      <file category="header" deviceDependent="1" name="firmware/source/lib/swmTrace/include/uart_common/uart_common.h"/>
+      <file category="header" deviceDependent="1" name="firmware/source/lib/swmTrace/include/swmTrace_api.h"/>
+      <file category="header" deviceDependent="1" name="firmware/source/lib/swmTrace/include/swmTrace_disable.h"/>
+      <file category="header" deviceDependent="1" name="firmware/source/lib/swmTrace/include/swmTrace_int.h"/>
+      <file attr="config" category="header" deviceDependent="1" name="firmware/source/lib/swmTrace/include/swmTrace_options.h" version="1.11.339"/>
+    </component>
+    <component Cclass="Device" Cgroup="Startup" Csub="Startup" Cvariant="source" Cvendor="ONSemiconductor" Cversion="1.11.339" deviceDependent="1">
+      <package name="RSL15" url="www.onsemi.com/" vendor="ONSemiconductor" version="1.11.339"/>
+      <file category="doc" deviceDependent="1" name="documentation/RSL15_html/RSL15_html.htm"/>
+      <file category="include" deviceDependent="1" name="firmware/include/"/>
+      <file category="source" condition="GCC_Condition" deviceDependent="1" name="firmware/source/lib/cmsis/source/sbrk.c"/>
+      <file category="source" condition="GCC_Condition" deviceDependent="1" name="firmware/source/lib/cmsis/source/start.c"/>
+      <file attr="config" category="source" deviceDependent="1" name="firmware/source/lib/cmsis/source/system_rsl15.c" version="1.0.0"/>
+      <file attr="config" category="source" condition="GCC_Condition" deviceDependent="1" name="firmware/source/lib/cmsis/source/GCC/startup.S" version="1.0.0"/>
+      <file attr="config" category="source" condition="GCC_Condition" deviceDependent="1" name="firmware/source/lib/cmsis/source/GCC/syscalls.c" version="1.11.339"/>
+      <file attr="config" category="linkerScript" condition="GCC_Condition_512" deviceDependent="1" name="firmware/configuration/GCC/sections.ld" version="1.0.0"/>
+      <file attr="config" category="header" deviceDependent="1" name="firmware/source/lib/drivers/RTE_config/RTE_Device.h" version="1.0.0"/>
+    </component>
+  </components>
+  <apis>
+    <api Capiversion="1.0.0" Cclass="Device" Cgroup="Bluetooth Core" Cvendor="ONSemiconductor" Cversion="1.0.0" exclusive="0">
+      <package name="RSL15" url="www.onsemi.com/" vendor="ONSemiconductor" version="1.11.339"/>
+      <file category="include" name="firmware/include/ble/"/>
+      <file category="include" name="firmware/include/ble/profiles/"/>
+    </api>
+  </apis>
+</configuration>
