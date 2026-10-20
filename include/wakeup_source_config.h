@@ -154,7 +154,7 @@ void Wakeup_Source_Config(void);
  *              RTC_CLK_SRC: RTC clock source
  *              RTC_ALARM_DURATION: RTC counter threshold
  */
-void RTC_ALARM_Init(uint32_t alarm_duration);
+void RTC_ALARM_Init(void);
 
 /**
  * @brief       Configure and enable clock source for RTC
@@ -175,27 +175,10 @@ void GPIO_Wakeup_Init(void);
 void RTC_ALARM_Set_Timeout(uint32_t timer_counter);
 
 /**
- * @brief       Set relative timeout for the RTC timer counter
- *              and calculate total elapsed RTC cycles. Function will
- *              set relative timer_counter value to RTC_CFG.
- * @param[in]   Timer_counter Start value(number of cycles)
- *              for RTC timer counter
- * @param[in]   Pre_timer_counter previously programmed
- *              timer_counter start value
- * @return      Programmed value of RTC_CFG register
- */
-uint32_t RTC_ALARM_Set_Relative_Timeout(uint32_t timer_counter, uint32_t pre_timer_counter);
-
-/**
  * @brief       Check RTC scheduler's status
  * @return      Current status of RTC Scheduler
  */
 RTC_Alarm_Sleep_t RTC_Alarm_Sleep_Check(void);
-
-#if 1
-void RTC_Clock_Config_Init(void);
-#endif
-
 
 /* ----------------------------------------------------------------------------
  * Close the 'extern "C"' block

@@ -52,6 +52,7 @@ struct connection_interval_time{
 #endif
 
 extern char APP_DEV_VER_BUFF[8];
+#define APP_DEV_NAME                 "AGMS_I10-1_%s_%02X%02X"
 #define APP_DEV_VER                  "V110"
 
 /* ----------------------------------------------------------------------------
@@ -113,16 +114,9 @@ void PrepareAdvScanData(void);
  */
 void APP_SendConCfm(uint8_t conidx);
 
-#if 1
-void ParamUpdateHandler(ke_msg_id_t const msg_id, void const *param,
-                    ke_task_id_t const dest_id, ke_task_id_t const src_id);
 
-void App_BLE_Power_Handler(ke_msg_id_t const msg_id, void const *param,
-        ke_task_id_t const dest_id, ke_task_id_t const src_id);
+void Authentication_Certify_Task(void);
 
-
-void  adv_activity_reset_process(void);
-#endif
 /* ----------------------------------------------------------------------------
  * Close the 'extern "C"' block
  * ------------------------------------------------------------------------- */

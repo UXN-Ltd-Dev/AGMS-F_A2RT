@@ -36,21 +36,50 @@ extern "C"
 
 /* Application headers */
 
-#define LSAD_INPUT_FAIL 	         (0)
-#define LSAD_INPUT_SUCCESS  	     (1)
+#define AB_CAPACITY      720u   /* 최대 저장 개수                    */
+#define AB_BATCH_MIN     1u     /* 1회 전송 최소 개수                 */
+#define AB_BATCH_MAX     60u    /* 1회 전송 최대 개수                 */
+#define AB_BATCH_DEFAULT 60u    /* 기본 배치 크기                    */
 
 
-#define LSAD_SAMPLE_DISABLE     0
-#define LSAD_SAMPLE_ENABLE      1
+/****************************************************************************
+ *	저장 단위
+ ****************************************************************************/
+typedef struct {
+    uint32_t epoch_time;
+    float we1;
+    float we2;
+    int16_t celsius;
+    int16_t flags;
+} agms_item_t;
 
-#define LSAD_SAMPLE_MODE    LSAD_SAMPLE_ENABLE
+typedef struct {
+	agms_item_t buf[AB_CAPACITY];
+	uint8_t run_mode;
+	uint8_t run_state;
 
+    uint16_t  head;      	/* 다음 쓰기 위치            */
+    uint16_t  tail;      	/* 가장 오래된 데이터 위치    */
+    uint16_t  count;     	/* 현재 저장 개수            */
+    uint16_t  pending;   	/* 전송 후 ACK 대기 중인 개수 */
+    uint16_t  remain;  		/* 전송 후 남아 있는 개수   */
+
+} agms_buff_t;
+extern agms_buff_t	agms_info;
+
+
+typedef struct {
+	agms_item_t  batch[AB_BATCH_MAX];  	/* 최대 60개 분량 확보 */
+    uint16_t   batch_n;              	/* 이번에 실제 보낸 개수 */
+    uint16_t   batch_size;           	/* 요청 배치 크기 1~60   */
+    uint16_t   batch_ramain;           	/* 남아 있는 개수   */
+
+} agms_batch_t;
+extern agms_batch_t	agms_batch;
 
 /* ----------------------------------------------------------------------------
  * Symbolic Constants
  * ------------------------------------------------------------------------- */
-#define NUM_LSAD_SAMPLE_COUNT          	(8U)
-#define NUM_LSAD_CHANNELS_USED          (3U)
 
 
 
@@ -58,56 +87,47 @@ extern "C"
  * Of the channels used in this application, this one is last in the sampling order.
  */
 
-#define LSAD_WEO_CHANNEL                (LSAD_INPUT_CH0)
-#define LSAD_REF_CHANNEL                (LSAD_INPUT_CH1)
-
-#define LSAD_IRQ_CHANNEL                (LSAD_INPUT_CH2)
 
 /* LSAD interrupt will trigger at approximately 98 Hz assuming 1 MHz slow clock and
  * LSAD_MODE_NORMAL is used.
  */
-#define LSAD_PRESCALE                   (LSAD_PS_1280H)
-
-#define NUM_SAMPLES                     (98U)
-#define ROUNDING_OFFSET                 (0.5f)
-
-#define DUMMY_OFFSET1                 	(45)
-#define DUMMY_OFFSET2                 	(60)
-#define DUMMY_OFFSET3                 	(65)
-#define DUMMY_OFFSET4                 	(70)
-
-/* User input work out GPIO */
-#define WEO_SENSOR_GPIO                 (LSAD_GPIO10_CFG)
-
-/* User input reference GPIO */
-#define REF_SENSOR_GPIO                 (LSAD_GPIO1_CFG)
 
 
 
+uint16_t lsad_calc_crc16(uint8_t *payload_buff, uint16_t length);
 
-uint16_t lsad_calc_crc16(uint16_t length);
-void append_data_time_payload(uint16_t idx, uint8_t year, uint8_t mon, uint8_t day, uint8_t hour, uint8_t min, uint8_t sec);
-void load_data_time_payload(uint16_t idx, uint8_t *year, uint8_t *mon, uint8_t *day, uint8_t *hour, uint8_t *min, uint8_t *sec);
-void append_epoch_time(uint16_t idx, uint32_t *e);
-void load_epoch_time(uint16_t idx, uint32_t *e);
+int8_t agms_buff_is_empty(const agms_buff_t *ab);
+int8_t agms_buff_is_full (const agms_buff_t *ab);
+
+void agms_buff_init(agms_buff_t *a);
+void agms_buff_reset(agms_buff_t *a);
+int8_t agms_buff_push_item(agms_buff_t *a, const agms_item_t *item);
+int8_t agms_buff_push(agms_buff_t *a, float we1, float we2, int16_t celsius, uint32_t epoch_time);
+int8_t agms_buff_pop(agms_buff_t *a, agms_item_t *out);
+uint16_t agms_buff_count(const agms_buff_t *a);
+uint16_t agms_buff_batch_clamp(uint16_t n);
+uint16_t agms_buff_peek(agms_buff_t *a, agms_item_t *out, uint16_t max_n);
+uint16_t agms_buff_commit(agms_buff_t *a, uint16_t n);
+
+
+void append_Potentiostat_data(void);
 
 uint16_t g_atoi16(uint8_t  *au8_buff, int i);
 uint32_t g_atoi32(uint8_t *au8_buff,  int i);
 void g_itoa16(uint16_t value, uint8_t *au8_buff);
 void g_itoa32(uint32_t value, uint8_t *au8_buff);
 
-void append_lsad_lvl_payload(void);
-void append_we_current(uint16_t idx, float we1, float we2);
+uint16_t agms_send_payload_packet(void);
+uint16_t agms_send_impedance_info_packet(uint8_t command);
+uint16_t agms_read_current_calendar(uint8_t status);
+
+void agms_callback_msg_event(uint8_t conidx, const uint8_t *rb_buff);
 
 
-void agms_send_payload_packet(uint8_t conidx);
-void agms_send_impedance_info_packet(uint8_t conidx, uint8_t command);
-
-void agms_request_current_data_time(uint8_t conidx, uint8_t status);
-
-void get_current_data_time_cmd(uint8_t conidx, uint8_t state);
-
-void progress_receive_msg_event(uint8_t conidx, const uint8_t *dest_buff);
+void rb_init(ring_buff_t *rb);
+int16_t rb_count(const ring_buff_t *rb);
+void rb_push(ring_buff_t *rb, float fwe1, float fwe2);
+int rb_flush_trimmed_average(ring_buff_t *rb, float *out_avg1, float *out_avg2);
 
 
 /* ----------------------------------------------------------------------------

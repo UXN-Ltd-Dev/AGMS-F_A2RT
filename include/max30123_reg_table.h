@@ -1,24 +1,7 @@
-/***************************************************************************//**
- * @file
- * @brief spidrv baremetal examples functions
- *******************************************************************************
- * # License
- * <b>Copyright 2020 Silicon Laboratories Inc. www.silabs.com</b>
- *******************************************************************************
- *
- * The licensor of this software is Silicon Laboratories Inc. Your use of this
- * software is governed by the terms of Silicon Labs Master Software License
- * Agreement (MSLA) available at
- * www.silabs.com/about-us/legal/master-software-license-agreement. This
- * software is distributed to you in Source Code format and is governed by the
- * sections of the MSLA applicable to Source Code.
- *
- ******************************************************************************/
-
 #ifndef MAX30123_REG_TABLE_H
 #define MAX30123_REG_TABLE_H
 
-#define MAX30123_TBL_SIZE  99	//103
+#define MAX30123_TBL_SIZE  97
 
 typedef struct {
   uint8_t reg;
@@ -51,7 +34,7 @@ const max30123_reg_t max30123_reg_tbl[MAX30123_TBL_SIZE] = {
   {0x29, 0x91},
   {0x31, 0x00},
   {0x33, 0x00},
-  {0x35, 0x0A},		//  {0x35, 0x1E},  30mV --> 10mV
+  {0x35, 0x05},		//  {0x35, 0x1E},  30mV --> 10mV
   {0x36, 0x00},
   {0x37, 0xC8},
   {0x38, 0x06},
@@ -91,9 +74,9 @@ const max30123_reg_t max30123_reg_tbl[MAX30123_TBL_SIZE] = {
   {0x6D, 0x00},
   {0x6E, 0x00},
   {0x6F, 0x00},
-  {0x70, 0x55},			// 200ms --> 16.6666ms
+  {0x70, 0x53},			// 200ms --> 16.6666ms --> 20ms...PSTAT
   {0x71, 0x03},			// Meas Average 1 --> 8
-  {0x72, 0xD6},			// 2.76ms
+  {0x72, 0xD6},			// 2.76ms...Chrono-A
   {0x73, 0x00},
   {0x74, 0x15},
   {0x75, 0x00},
@@ -105,8 +88,6 @@ const max30123_reg_t max30123_reg_tbl[MAX30123_TBL_SIZE] = {
   {0x7B, 0x00},
   {0x7C, 0x10},
   {0x7D, 0x00},
-  {0x80, 0x00},
-  {0x81, 0x00},
   {0x84, 0x00},
   {0x85, 0x15},
   {0x86, 0x04},

@@ -19,15 +19,25 @@
 #define APP_GLOBALS_H
 
 #define	_CUSTOM_DEBUG_ 				0
-#define	_EIS_FIFO_INFO_DEBUG_ 		0
+#define	_EIS_FIFO_INFO_DEBUG_ 		1
 #define _IMPEDANCE_INFO_DEBUG_		0
-#define _IMPEDANCE_RESULT_DEBUG_	1
+#define _IMPEDANCE_RESULT_DEBUG_	0
 
 
 #define UNIX_TIME_DISABLE	0
 #define UNIX_TIME_ENABLE	1
 
 #define UNIX_TIME_MODE 	UNIX_TIME_ENABLE
+
+#define LOG_FLOAT_MARKER  "%c%ld.%04ld"
+#define LOG_FLOAT_MARKER1 "%c%ld.%02ld"
+
+
+#define LOG_FLOAT(val) (val > 0 || val <=-1) ?' ':'-',        \
+                      (int32_t)(val),                                                         \
+                       (int32_t)(((val > 0) ? (val) - (int32_t)(val)       \
+                       : (int32_t)(val) - (val))*10000)
+
 
 /* ----------------------------------------------------------------------------
  * Defines
@@ -46,13 +56,15 @@
 #define GET_BYTE_C(data) ((uint8_t)(((data) >> 16) & 0xFF))
 #define GET_BYTE_D(data) ((uint8_t)(((data) >> 24) & 0xFF)) /* MSB (가장 상위 바이트) */
 
+
+
 /* ----------------------------------------------------------------------------
  * user defines
  * --------------------------------------------------------------------------*/
 #define BLE_PARAM_UPDATE_TIME	 	2
 #define CUSTOMSS_NOTIFY_ON_TIME		10
 
-#define FIRMWARE_MAIN			2
+#define FIRMWARE_MAIN				10
 #define FIRMWARE_SUB			    0
 
 
@@ -127,27 +139,27 @@
 #define RECEIVE_LSAD_STATE_ID	1
 #define RECEIVE_REQUEST_RTC		2
 
-#define RECEIVE_FOTA_READY				0x10
+#define RECEIVE_FOTA_READY			0x10
 #define RECEIVE_ANALOG_POWER    	0x11
-#define RECEIVE_NOTIFY_TIME     			0x12
+#define RECEIVE_NOTIFY_TIME     	0x12
 #define RECEIVE_REQUEST_INFORM  	0x13
 
 #define RECEIVE_POWER_OFF		0x20
 #define RECEIVE_CALI_RESET		0x30
 
-#define NO_ERROR				0
+#define NO_ERROR					0
 
 #define AGMS_POWER_ON				0
-#define AGMS_POWER_OFF			1
+#define AGMS_POWER_OFF				1
 
-#define API_FALSE				0
+#define API_FALSE					0
 #define API_TRUE					1
 
-#define DISABLE				0
-#define ENABLE					1
+#define DISABLE						0
+#define ENABLE						1
 
-#define UPDATE_WAIT		0
-#define UPDATE_TRUE		1
+#define UPDATE_WAIT					0
+#define UPDATE_TRUE					1
 
 #define STRIPPING_NONE				0
 #define STRIPPING_RUN				1
@@ -155,7 +167,7 @@
 
 #define ADV_STATE_NONE				0
 #define ADV_STATE_STOP				1
-#define ADV_STATE_START			2
+#define ADV_STATE_START				2
 
 
 /* ----------------------------------------------------------------------------
@@ -166,6 +178,9 @@
 #define DATE_TIME_UPDATE_FAIL		1
 #define DATE_TIME_UPDATE_SUCCESS	2
 
+#define CALENDAR_UPDATE_NONE		0
+#define CALENDAR_UPDATE_FAIL		1
+#define CALENDAR_UPDATE_SUCCESS		2
 
 #define REQUEST_RTC_COMMAND			0x41
 #define TRANSFER_COMMAND			0x42
@@ -175,20 +190,22 @@
 #define EIS_WAIT_COMMAND       		0x46
 #define PULSE_START_COMMAND    		0x50
 
+#define CHRONO_A_INFO_COMMAND  		0x45
 
 
-#define REQUEST_RTC_FIRST_STATE			0x11
+#define READ_UNIX_TIME_COMMAND		0x11
+
+#define REQUEST_RTC_FIRST_STATE		0x11
 #define REQUEST_RTC_ERROR_STATE		0x12
-#define REPLY_BASIC_INFORM						0x22
-#define REPLY_RE_CONNECTION					0x23
+#define REPLY_BASIC_INFORM			0x22
+#define REPLY_RE_CONNECTION			0x23
 
-#define REQUEST_BASIC_INFO_STATE		0x22
-#define TRANSMITTER_POWER_OFF			0x24
-#define TRANSMITTER_DFU_FOTA				0x25
+#define REQUEST_BASIC_INFO_STATE	0x22
+#define TRANSMITTER_POWER_OFF		0x24
+#define TRANSMITTER_DFU_FOTA		0x25
 
-
-#define CALB_TEMP_CLEAR					0x01
-#define CALB_TEMP_SETUP					0x02
+#define CALB_TEMP_CLEAR				0x01
+#define CALB_TEMP_SETUP				0x02
 
 
 
@@ -232,7 +249,7 @@ enum {
 };
 
 
-typedef struct _date_time{
+typedef struct {
 	uint8_t year;
 	uint8_t mon;
 	uint8_t day;
@@ -242,77 +259,71 @@ typedef struct _date_time{
 	uint8_t sec;
 
 	uint8_t update;
-	uint8_t sync;
+	uint8_t resync;
 
-	uint32_t base_sec;
+    uint32_t base_epoch;
+    uint32_t base_second;
 
-} current_date_time_t;
+} calendar_t;
+extern calendar_t	calendar;
 
-extern current_date_time_t	_current_date_time;
-extern current_date_time_t	*current_date_time;
+#define AGMS_MODE_PSTAT			0
+#define AGMS_MODE_CHRONO_A		1
 
-//--------------------------------------------------------------------------------
+#define AUTHENTICATION_FAIL			0
+#define AUTHENTICATION_SUCCESS		1
+
+#define CEM102_DAC_POWER_OFF	0
+#define CEM102_DAC_POWER_ON		1
+typedef struct {
+	uint8_t authentication;
+	uint8_t auth_count;
+	uint8_t cem102_dac_power;
+	uint8_t agms_mode;
+
+	int16_t vbat_lvl;
+	int16_t celsius;
+
+	float we1_current;
+	float we2_current;
+
+} device_info_t;
+
+extern device_info_t	device_info;
+
+
+
+#define TEMP_CALIB_CLEAR			0
+#define TEMP_CALIB_ALLOW			'C'
+
+#define TEMP_CALIB_WAIT_STEP		0
+#define TEMP_CALIB_RUN_STEP			1
+#define TEMP_CALIB_IDLE_STEP		2
+
+#define TEMP_CALI_DISABLE			0
+#define TEMP_CALI_ENABLE			1
+#define TEMP_CALI_MODE				TEMP_CALI_ENABLE
 
 typedef struct {
-	uint8_t notifying;
-	uint8_t cuss_ntf_timeout;
-	uint8_t date_time_update;
-	uint8_t adv_scan_mode;
+	int8_t calib_status;							// 저장된 상태를 확인 한다.
+	int8_t calib_step;
 
-	uint8_t is_connect_count;
-	uint8_t send_init;
-	uint8_t send_count;
-	uint8_t param_update_cmd;
+	int16_t calib_wait_time;
+	int16_t calib_run_count;
+	int16_t calib_average;
 
-	uint8_t nvr3_update_cmd;
-	uint8_t nvr3_update_count;
-	uint8_t adv_power_config;
-	uint8_t power_off_cmd;
+	int32_t calib_sum;
+} lsad_temp_t;
 
-	uint8_t agms_power_mode;
-	uint8_t agms_adv_start;
-	uint8_t agms_adv_state;
-	uint8_t device_code;
-
-	uint16_t vbat_lvl_mV;			// LSAD VALUE
-	uint16_t temperature;
-
-	float 		vbat_level;			// LSAD VALUE
-	float 		Temperature;
-
-
-}rsl15_info_t;
-extern rsl15_info_t _rsl15_info;
-extern rsl15_info_t *rsl15_info;
-
-typedef struct {
-	uint8_t  stripping_dump;
-	uint8_t  stripping_status;
-//	uint8_t  measure_update;
-
-	uint16_t weo1_lvl_mV;
-	uint16_t weo2_lvl_mV;
-
-	double we1_current;
-	double we2_current;
-
-	uint16_t wep1_lvl_mV;
-	uint16_t wep2_lvl_mV;
-
-	uint16_t ref_lvl_mV;
-	uint16_t vbat_lvl_mV;			// CEM102 VALUE
-
-	uint16_t stripping_time;			// stripping time...600sec
-	uint16_t stripping_tmout;
-
-
-} afe_102_t;
-extern afe_102_t	_afe_102;
-extern afe_102_t	*afe_102;
+extern lsad_temp_t	lsad_temp;
 
 
 //--------------------------------------------------------------------------------
-
+#define AGMS_NORMAL_STATE		0
+#define AGMS_POWER_STABILIZE	1
+#define AGMS_SENSOR_STABILIZE	2
+#define AGMS_SENSOR_RECOVERY	3
+#define AGMS_SENSOR_CALIBRATION	5
 
 typedef struct {
 	uint32_t sec:6;
@@ -328,63 +339,51 @@ typedef union {
 	tyFLAGBITS b;
 } tyFLAG;
 
-typedef struct {
-	uint16_t exponent;
-	uint8_t  mantissa;
-} we_lvl_t;
+/**************************************************************************************
+ *	STEP UP
+ **************************************************************************************/
+#define STEP_END_BUFFER   128	// total 120
+#define STEP_PER_BUFFER   132   /* 30초 @ 1Hz */
 
 typedef struct {
-	uint8_t run_mode;
-	uint8_t dummy1;
+    float    we1;
+    float    we2;
 
-	uint16_t idx_head;
-	uint16_t idx_tail;
-	uint16_t send_pos;
+} sample_t;
 
-//	tyFLAG	 date_time[LSAD_BUFFER_SIZE+4];			// DATE & TIME
-	we_lvl_t we1_current[LSAD_BUFFER_SIZE+4];		// EXPONENT
-	we_lvl_t we2_current[LSAD_BUFFER_SIZE+4];		// MANTISSA
-	uint16_t Temperature[LSAD_BUFFER_SIZE+4];		// 온도 정보
-	uint32_t Epoch_Time[LSAD_BUFFER_SIZE+4];			// EPOCH UNIX TIME
-} agms_info_t;
+typedef struct {
+    sample_t data[STEP_PER_BUFFER];
 
-extern agms_info_t	_agms_info;
-extern agms_info_t	*agms_info;
+    uint8_t ovf_state;  					// STEP DATA 전송 이후 응답이 오지 않을 경우
+    uint8_t ovf_tmout;  					// 30초 동안 응답이 없으면...
+
+    uint16_t count;  						// 저장되는 갯수
+    uint16_t Qpos;   						// 데이터 보내는 위치
+
+    uint16_t send_pos;
+    uint16_t dummy1;
+
+
+    uint32_t epoch;							// 처음 저장 하는 시간만 저장
+} step_buffer_t;
+
+extern step_buffer_t *step_store_buf;   /* 지금 데이터를 쌓는 버퍼 */
+
+
+#define CAP 10   				// 버퍼 용량. 한 주기 최대 유입(9개)보다 크게 둔다.
+typedef struct {
+    float	we1_buff[CAP+4];
+    float	we2_buff[CAP+4];
+    volatile int16_t head;    	// 가장 오래된 데이터 위치
+    volatile int16_t count;   	// 현재 저장된 실제 데이터 개수
+} ring_buff_t;
+
+extern ring_buff_t	ring_buff;
+
+
 
 extern uint8_t agms_payload_buff[LSAD_SEND_SIZE];
 
-
-#define TEMP_CALIB_CLEAR			0
-#define TEMP_CALIB_ALLOW			5
-
-#define TEMP_CALIB_WAIT_STEP		0
-#define TEMP_CALIB_CUMU_STEP		1
-#define TEMP_CALIB_IDLE_STEP		2
-
-
-typedef struct {
-	int8_t cal_status;							// 저장된 상태를 확인 한다.
-	int8_t cal_step;
-	int8_t dummy1;
-	int8_t dummy2;
-
-	int16_t wait_count;							// 8초 간격으로 데이터...40 * 8 = 320sec 이후 계산
-	int16_t cumulative_count;					// 8초 간격으로 데이터...40 * 8 = 320sec 동안 계산
-	int16_t current_ave;
-	int16_t absolute_offset;
-
-} Temp_calibration_t;
-
-extern Temp_calibration_t	Temp_calibration;
-
-
-typedef struct
-{
-    uint32_t base_epoch;
-    uint32_t base_second;
-
-} epoch_time_t;
-extern epoch_time_t	epoch_time;
 
 
 /**

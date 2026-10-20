@@ -33,11 +33,16 @@ extern "C"
 #include <gattc_task.h>
 #include <app.h>
 
+/* ----------------------------------------------------------------------------
+ * Defines
+ * --------------------------------------------------------------------------*/
+#define CEM102_OTP_DATA_SIZE                 (32)
 
-#define CUSS_ENABLE_TEMPERATURE_CHAR    (1)
+
+extern uint8_t cs0_attr_to_send;
 
 /* ----------------------------------------------------------------------------
- * sodykim define 
+ * sodykim define
  * --------------------------------------------------------------------------*/
 #define CS0_TX_PERMISSIONS               (PERM(RD, ENABLE) \
                                          | PERM(WRITE_REQ, ENABLE) \
@@ -46,39 +51,6 @@ extern "C"
 
 #define CS0_RX_PERMISSIONS               (PERM(RD, ENABLE) | PERM(NTF, ENABLE))
 
-/* Custom service UUIDs and characteristics */
-
-/* Custom service UUIDs */
-#define CS_SVC_UUID                     { 0x24, 0xdc, 0x0e, 0x6e, 0x01, 0x40, \
-                                          0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
-                                          0xb5, 0xf3, 0x93, 0xe0 }
-/**
- * @brief       The UUIDs for the characteristics of custom service 0
- * @details     These 128-bit UUIDs are used during Bluetooth Low Energy
- *              communications to identify the various characteristics and data
- *              that belong to custom service 0.
- *              Refer to the ReadMe for details about the functions of each
- *              characteristic.
- */
-#define CS0_CHAR_TX_UUID                 { 0x24, 0xdc, 0x0e, 0x6e, 0x03, 0x40, \
-                                          0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
-                                          0xb5, 0xf3, 0x93, 0xe0 }
-
-#define CS0_CHAR_RX_UUID                 { 0x24, 0xdc, 0x0e, 0x6e, 0x02, 0x40, \
-                                          0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
-                                          0xb5, 0xf3, 0x93, 0xe0 }
-                                          
-#define CS0_VALUE_MAX_LENGTH     		  (20)    /* Used by the TX and RX characteristics */
-
-#define CS0_CHAR_TX_NAME                 "TX_VALUE"
-#define CS0_CHAR_RX_NAME                 "RX_VALUE"
-
-
-
-/* ----------------------------------------------------------------------------
- * Defines
- * --------------------------------------------------------------------------*/
-#define CEM102_OTP_DATA_SIZE                 (32)
 
 /* Diagnostics functions variable data to be sent to a mobile device. */
 typedef struct
@@ -102,10 +74,9 @@ typedef struct
 #define ATTR_FOUND                             (1)
 #define ATTR_ERROR                             (-1)
 
+
 /* Custom service UUIDs and characteristics */
-
-/* Custom service UUIDs */
-
+#if 1
 #define CS0_SVC_UUID                           { 0x24, 0xdc, 0x0e, 0x6e, 0x01, 0x80, \
                                                  0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
                                                  0xb5, 0xf3, 0x93, 0xe0 }
@@ -118,8 +89,85 @@ typedef struct
 												 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
 												 0xb5, 0xf3, 0x93, 0xe0 }
 
+#define CS0_CHAR_BAT_CEM102_UUID               { 0x24, 0xdc, 0x0e, 0x6e, 0x12, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS0_CHAR_WE1_CURRENT_UUID              { 0x24, 0xdc, 0x0e, 0x6e, 0x13, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS0_CHAR_WE2_CURRENT_UUID              { 0x24, 0xdc, 0x0e, 0x6e, 0x14, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS0_CHAR_RE_UUID                       { 0x24, 0xdc, 0x0e, 0x6e, 0x15, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
 
 
+#if APP_MEASURE_ACROSS_IO_INPUTS
+#define CS0_CHAR_TEMP_UUID                     { 0x24, 0xdc, 0x0e, 0x6e, 0x16, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS0_CHAR_WE1_VOLTAGE_UUID              { 0x24, 0xdc, 0x0e, 0x6e, 0x17, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS0_CHAR_WE2_VOLTAGE_UUID              { 0x24, 0xdc, 0x0e, 0x6e, 0x18, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#endif
+#define CS0_CHAR_CEM102_ERR_UUID               { 0x24, 0xdc, 0x0e, 0x6e, 0x19, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#if CEM102_DIAG_FUNCTIONS
+#define CS1_SVC_UUID                           { 0x24, 0xdc, 0x0e, 0x6e, 0x01, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_CURRENT_REF_RATIO_UUID        { 0x24, 0xdc, 0x0e, 0x6e, 0x02, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_WE1_CURRENT_OFFSET_UUID       { 0x24, 0xdc, 0x0e, 0x6e, 0x03, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_WE2_CURRENT_OFFSET_UUID       { 0x24, 0xdc, 0x0e, 0x6e, 0x04, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_WE1_VOLTAGE_REF_UUID          { 0x24, 0xdc, 0x0e, 0x6e, 0x05, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_WE2_VOLTAGE_REF_UUID          { 0x24, 0xdc, 0x0e, 0x6e, 0x06, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_RE_VOLTAGE_REF_UUID           { 0x24, 0xdc, 0x0e, 0x6e, 0x07, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_AT1_CURRENT_RESIDUAL_UUID     { 0x24, 0xdc, 0x0e, 0x6e, 0x08, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_AT2_CURRENT_RESIDUAL_UUID     { 0x24, 0xdc, 0x0e, 0x6e, 0x09, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_WE1_CURRENT_RESIDUAL_UUID     { 0x24, 0xdc, 0x0e, 0x6e, 0x0a, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_WE2_CURRENT_RESIDUAL_UUID     { 0x24, 0xdc, 0x0e, 0x6e, 0x0b, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_RE_CE_CURRENT_RESIDUAL_UUID   { 0x24, 0xdc, 0x0e, 0x6e, 0x0c, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_CHAR_RE_CURRENT_RESIDUAL_UUID      { 0x24, 0xdc, 0x0e, 0x6e, 0x0d, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#define CS1_OTP_DATA_UUID                      { 0x24, 0xdc, 0x0e, 0x6e, 0x0e, 0x80, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
+#endif
+
+
+#else
+/* Custom service UUIDs */
+#define CS0_SVC_UUID                           { 0x24, 0xdc, 0x0e, 0x6e, 0x01, 0x60, \
+                                                 0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
+                                                 0xb5, 0xf3, 0x93, 0xe0 }
 
 #define CS0_CHAR_BAT_CEM102_UUID               { 0x24, 0xdc, 0x0e, 0x6e, 0x02, 0x60, \
                                                  0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
@@ -133,6 +181,8 @@ typedef struct
 #define CS0_CHAR_RE_UUID                       { 0x24, 0xdc, 0x0e, 0x6e, 0x05, 0x60, \
                                                  0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
                                                  0xb5, 0xf3, 0x93, 0xe0 }
+
+
 #if APP_MEASURE_ACROSS_IO_INPUTS
 #define CS0_CHAR_TEMP_UUID                     { 0x24, 0xdc, 0x0e, 0x6e, 0x06, 0x60, \
                                                  0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
@@ -190,15 +240,16 @@ typedef struct
 #define CS1_OTP_DATA_UUID                      { 0x24, 0xdc, 0x0e, 0x6e, 0x0e, 0x70, \
                                                  0xca, 0x9e, 0xe5, 0xa9, 0xa3, 0x00, \
                                                  0xb5, 0xf3, 0x93, 0xe0 }
+#endif
 
 #endif /* CEM102_DIAG_FUNCTIONS */
 
-#define CS0_AGMS_MAX_LENGTH                    260
 
 #define CS0_VBAT_MAX_LENGTH                    2
 #define CS0_WE1_CURRENT_MAX_LENGTH             4
 #define CS0_WE2_CURRENT_MAX_LENGTH             4
 #define CS0_CEM102_ERR_MAX_LENGTH              1
+#define CS0_AGMS_VALUE_MAX_LENGTH              512
 
 #if APP_MEASURE_ACROSS_IO_INPUTS
 #define CS0_TEMP_MAX_LENGTH                    4
@@ -222,17 +273,12 @@ typedef struct
 #define CS1_OTP_DATA_MAX_LENGTH               CEM102_OTP_DATA_SIZE
 #endif /* CEM102_DIAG_FUNCTIONS */
 
-#define CS0_AGMS_SEND_CHAR_NAME                 "AGMS_SEND_VALUE"
-#define CS0_AGMS_READ_CHAR_NAME                 "AGMS_READ_VALUE"
-
 #define CS0_VBAT_CEM102_CHAR_NAME              "CEM102 Battery (mV)"
 #define CS0_WE1_CURRENT_CHAR_NAME              "WE1 Current (nA)"
 #define CS0_WE2_CURRENT_CHAR_NAME              "WE2 Current (nA)"
 #define CS0_CEM102_ERR_CHAR_NAME               "CEM102 Error Status"
-#if 1		// add sodykim
-#define CS0_RE_CHAR_NAME               		  	"Reference Electrode (nA)"
-#endif
-
+#define CS0_AGMS_SEND_CHAR_NAME                "AGMS Send Value"
+#define CS0_AGMS_READ_CHAR_NAME                "AGMS Read Value"
 
 
 #if APP_MEASURE_ACROSS_IO_INPUTS
@@ -257,6 +303,9 @@ typedef struct
 #define CS1_OTP_DATA_CHAR_NAME                 "OTP Data"
 #endif /* CEM102_DIAG_FUNCTIONS */
 
+
+
+
 #define CS0_CEM102_ERR_VBAT_THRESHOLD_POS      0
 #define CS0_CEM102_ERR_VDDA_ERROR_POS          1
 #define CS0_CEM102_ERR_DIG_RST_ERROR_POS       2
@@ -268,34 +317,19 @@ typedef struct
 #define CS0_CEM102_ERR_DIG_RST                 (uint8_t)(1U << CS0_CEM102_ERR_DIG_RST_ERROR_POS)
 #define CS0_CEM102_ERR_VCC_LOW                 (uint8_t)(1U << CS0_CEM102_ERR_VCC_LOW_POS)
 
-#define CS0_CEM102_ERR_VBAT_THRESHOLD_POS 0
-#define CS0_CEM102_ERR_VDDA_ERROR_POS     1
-#define CS0_CEM102_ERR_DIG_RST_ERROR_POS  2
-
 /* Custom service ID */
 /* Used in calculating attribute number for given custom service */
 enum CUST_SVC_ID
 {
     CUST_SVC0,
     CUST_SVC1,
+    CUST_SVC2,
 };
 
 enum CS0_att
 {
     /* Service 0 */
     CS0_SERVICE,
-
-	/* AGMS Send Characteristic in Service 0 */
-    CS0_AGMS_SEND_VALUE_CHAR0,
-    CS0_AGMS_SEND_VALUE_VAL0,
-    CS0_AGMS_SEND_VALUE_CCC0,
-    CS0_AGMS_SEND_VALUE_USR_DSCP0,
-
-	/* AGMS Read Characteristic in Service 0 */
-    CS0_AGMS_READ_VALUE_CHAR0,
-    CS0_AGMS_READ_VALUE_VAL0,
-    CS0_AGMS_READ_VALUE_CCC0,
-    CS0_AGMS_READ_VALUE_USR_DSCP0,
 
     /* Reference electrode Characteristic in Service 0 */
     CS0_VBAT_CEM102_VALUE_CHAR0,
@@ -320,6 +354,17 @@ enum CS0_att
     CS0_CEM102_ERR_VALUE_VAL0,
     CS0_CEM102_ERR_VALUE_CCC0,
     CS0_CEM102_ERR_VALUE_USR_DSCP0,
+
+    /* always glucos electrode 1 Characteristic in Service 0 */
+    CS0_AGMS_SEND_VALUE_CHAR0,
+    CS0_AGMS_SEND_VALUE_VAL0,
+    CS0_AGMS_SEND_VALUE_CCC0,
+    CS0_AGMS_SEND_VALUE_USR_DSCP0,
+
+    CS0_AGMS_READ_VALUE_CHAR0,
+    CS0_AGMS_READ_VALUE_VAL0,
+    CS0_AGMS_READ_VALUE_CCC0,
+    CS0_AGMS_READ_VALUE_USR_DSCP0,
 
 #if APP_MEASURE_ACROSS_IO_INPUTS
     /* Temperature Characteristic in Service 0 */
@@ -435,15 +480,43 @@ enum CS1_att
 };
 #endif /* CEM102_DIAG_FUNCTIONS */
 
+
+enum CS2_att
+{
+    /* Service 2 */
+    CS2_SERVICE,
+
+    /* CEM102 AGMS DATA SEND Data Characteristic in Service 3 */
+    CS2_AGMS_SEND_VALUE_CHAR0,
+    CS2_AGMS_SEND_VALUE_VAL0,
+    CS2_AGMS_SEND_VALUE_CCC0,
+    CS2_AGMS_SEND_VALUE_USR_DSCP0,
+
+    /* CEM102 AGMS DATA REND Data Characteristic in Service 3 */
+    CS2_AGMS_READ_VALUE_CHAR0,
+    CS2_AGMS_READ_VALUE_VAL0,
+    CS2_AGMS_READ_VALUE_CCC0,
+    CS2_AGMS_READ_VALUE_USR_DSCP0,
+
+
+    /* Max number of services and characteristics */
+    CS2_NB,
+};
+
+
 /* States for sending the notification over BLE */
 enum
 {
     APP_ATTR_SEND_FIRST = 0,
-    APP_ATTR_SEND_AGMS_VALUE,
     APP_ATTR_SEND_VBAT_VALUE,
     APP_ATTR_SEND_WE1_CURRENT,
     APP_ATTR_SEND_WE2_CURRENT,
     APP_ATTR_SEND_ERROR_CODE,
+    APP_ATTR_SEND_AGMS_VALUE,
+    APP_ATTR_SEND_AGMS_CONTINUEOUS,
+    APP_ATTR_READ_CALENDAR,
+    APP_ATTR_CUSS_MAX30123,
+
 #if APP_MEASURE_ACROSS_IO_INPUTS
     APP_ATTR_SEND_TEMPERATURE,
     APP_ATTR_SEND_WE1_VOLTAGE,
@@ -467,12 +540,20 @@ enum
     APP_ATTR_SEND_LAST,
 };
 
+
+/* States for sending the notification over BLE */
+enum
+{
+    APP_AGMS_SEND_FIRST = 0,
+    APP_AGMS_SEND_WE_CURRENT,
+    APP_AGMS_SEND_CONTINUES,
+    APP_AGMS_SEND_CALENDAR,
+    APP_AGMS_SEND_LAST,
+};
+
+
 struct app_env_tag_cs0
 {
-    /* To BLE agms transfer buffer */
-    uint8_t agms_to_air_buffer[CS0_AGMS_MAX_LENGTH];
-    uint16_t agms_to_air_cccd_value[APP_MAX_NB_CON];
-
     /* To BLE WE 1 transfer buffer */
     uint8_t vbat_to_air_buffer[CS0_VBAT_MAX_LENGTH];
     uint16_t vbat_to_air_cccd_value[APP_MAX_NB_CON];
@@ -489,6 +570,10 @@ struct app_env_tag_cs0
     uint8_t cem102_err_to_air_buffer[CS0_CEM102_ERR_MAX_LENGTH];
     uint16_t cem102_err_to_air_cccd_value[APP_MAX_NB_CON];
 
+    /* To BLE agms transfer buffer */
+    uint8_t cem102_agms_to_air_buffer[CS0_AGMS_VALUE_MAX_LENGTH];
+    uint16_t cem102_agms_to_air_cccd_value[APP_MAX_NB_CON];
+
 #if APP_MEASURE_ACROSS_IO_INPUTS
     /* To BLE Temperature transfer buffer */
     uint8_t temp_to_air_buffer[CS0_TEMP_MAX_LENGTH];
@@ -503,6 +588,7 @@ struct app_env_tag_cs0
     uint16_t we2_volt_to_air_cccd_value[APP_MAX_NB_CON];
 #endif /* APP_MEASURE_ACROSS_IO_INPUTS */
 };
+extern struct app_env_tag_cs0 app_env_cs0;;
 
 struct app_env_tag_cs1
 {
@@ -548,14 +634,19 @@ struct app_env_tag_cs1
 #endif /* CEM102_DIAG_FUNCTIONS */
 };
 
+struct app_env_tag_cs2
+{
+    /* To BLE agms transfer buffer */
+    uint8_t cem102_agms_to_air_buffer[CS0_AGMS_VALUE_MAX_LENGTH];
+    uint16_t cem102_agms_to_air_cccd_value[APP_MAX_NB_CON];
+};
+
+
 enum custom_app_msg_id
 {
     CUSTOMSS_NTF_TIMEOUT = TASK_FIRST_MSG(TASK_ID_APP) + 60,
-    APP_CUSS_AGMS_REQ_DATE_TIME,
-    APP_CUSS_AGMS_NEXT_SEND_DATA,
-	APP_CUSS_PARAM_UPDATE_REQ,
-	APP_CUSS_CHRONO_A_TIMEOUT,
-	APP_CUSS_AFE_WAKEUP_TIMEOUT
+    CEM102_MEASUREMENT_START_TIMEOUT,
+	CUSTOMSS_AGMS_TIMEOUT,
 };
 
 /* ----------------------------------------------------------------------------
@@ -590,15 +681,17 @@ void CUSTOMSS_Initialize(void);
 void CUSTOMSS_StartTimer(void);
 
 
-void CUSTOMSS_AFE_Wakeup_Timeout(void);
+/**
+ * @brief       Start the timer. If it is already running, stop and restart it.
+ */
+void CUSTOMSS_AGMS_Start_Timer(uint8_t conidx, uint32_t notifyOnTimeout);
+
+void CUSTOMSS_AGMS_Clear_Time(uint8_t conidx);
 
 /**
  * @brief       Set the notification timer to expire immediately
  */
 void CUSTOMSS_Notify_Now(void);
-
-
-void Call_Custom_NTF_Timeout(uint32_t timeout);
 
 /**
  * @brief       Configure custom service to send periodic notifications
@@ -657,8 +750,6 @@ uint8_t CUSSTOMSS_CS0_Callback(uint8_t conidx, uint16_t attidx,
                                uint16_t length, uint16_t operation, uint8_t hl_status,
                                uint8_t *cfm_msg_instr);
 
-
-
 #if CEM102_DIAG_FUNCTIONS
 /**
  * @brief       Data access callback function for CS1 characteristics
@@ -701,25 +792,13 @@ uint8_t CUSSTOMSS_CS1_Callback(uint8_t conidx, uint16_t attidx,
                                uint8_t *cfm_msg_instr);
 #endif
 
-
-// sodykim add for BLE rx callback
-uint8_t App_BLE_CUSSReadWriteRequestCallback(uint8_t conidx, uint16_t attidx,
-    uint16_t handle, uint8_t *dest_buffer, const uint8_t *src_buffer,
-    uint16_t length, uint16_t operation, uint8_t hl_status,
-    uint8_t *cfm_msg_instr);
-
-
-void set_agms_base_info(uint8_t base_info);
-uint8_t get_agms_base_info(void);
-
-void set_agms_conidx(uint8_t conidx);
-uint8_t get_agms_conidx(void);
+void Call_Custom_NTF_Timeout(uint32_t timeout);
+void Custom_Chrono_A_Timeout(uint32_t timeout);
 
 uint8_t read_custom_irq(void);
 void clear_custom_irq(void);
 
-
-void app_custom_send_payload_packet(void);
+void max30123_send_attribute(uint8_t cs0_attr_to_send);
 
 /* ----------------------------------------------------------------------------
  * Close the 'extern "C"' block

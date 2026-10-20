@@ -45,6 +45,20 @@ extern "C"
  */
 uint32_t App_Utils_ConvertFloatToUInt32(float data);
 
+
+void system_delay_ms(int tmout);
+void set_epoch_time(calendar_t *t, uint32_t epoch);
+uint32_t get_epoch_time(calendar_t *t);
+void epoch_time_to_calendar(calendar_t *t, uint32_t epoch_time);
+
+
+void App_Flash_Config_Init(void);
+FlashStatus_t App_Write_Flash_Buffer(uint32_t addr, uint32_t *result_data, size_t value_size);
+FlashStatus_t App_Read_Flash_Buffer(uint32_t addr, uint32_t *result_data, size_t value_size);
+
+int8_t read_nvr4_lsad_temp_info(int16_t *offset_data);
+void write_nvr4_lsad_temp_info(uint32_t  offset_data, uint32_t  offset_status);
+
 /* ----------------------------------------------------------------------------
  * Close the 'extern "C"' block
  * ------------------------------------------------------------------------- */

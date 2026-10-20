@@ -38,7 +38,6 @@ extern "C"
 #include <ble_abstraction.h>
 
 /* Application headers */
-#include <app_customss.h>
 #include <app_bass.h>
 #include <app_init.h>
 #include <app_msg_handler.h>
@@ -47,11 +46,15 @@ extern "C"
 #include "RTE_Device.h"
 #include "app_cem102.h"
 #include "app_lowpwr_manager.h"
+#include "app_button.h"
 
 #include "app_globals.h"
-#include "app_utility.h"
 #include "app_agms.h"
-#include "app_temperature_sensor.h"
+#include "app_customss.h"
+#include "app_agms.h"
+#include "app_utils.h"
+
+#include "app_temper_sensor.h"
 
 #include "app_max30123.h"
 
@@ -70,15 +73,6 @@ typedef struct
 /* ----------------------------------------------------------------------------
  * Defines
  * --------------------------------------------------------------------------*/
-
-#define _UXN_CODE_		1
-
-#define TEMP_CALI_DISABLE		0
-#define TEMP_CALI_ENABLE		1
-#define TEMP_CALI_MODE			TEMP_CALI_ENABLE
-
-
-
 /* This can be used at the application level to toggle
  * the inclusion of all button_manager code */
 #define BUTTON_MANAGER_ENABLED          0
@@ -145,26 +139,23 @@ enum {
     APP_MAX_PROF_SVC_COUNT
 };
 
-/* Select one of the measurements by setting the definition of
- * APP_MEASURE_ACROSS_IO_INPUTS to either 1 or 0. */
+/* 
+ * By setting APP_MEASURE_ACROSS_IO_INPUTS to 1, we enable the thermistor
+ * application by default.
+ */
 #define APP_MEASURE_ACROSS_IO_INPUTS    0
-#define APP_MEASURE_ACROSS_WE_INPUTS    (!APP_MEASURE_ACROSS_IO_INPUTS)
-
-#if APP_MEASURE_ACROSS_IO_INPUTS
-#define APP_MEASURE_OFFSET_VOLTAGE      0
-#define APP_MEASURE_RESISTOR_VOLTAGE    1
-#define APP_MEASURE_VDDA_VOLTAGE        2
-#define APP_MEASURE_VOLTAGE_TYPES       3
-
-/* Set the frequency of the IO measurements.
- * Represents the number of WE channel measurements to perform for each IO
- * measurement (set to 3 as an example in this application but it can be set
- * to other desirable values). */
-#define APP_VOLTAGE_MEASUREMENT_EXPIRY   3
 
 /* States to track which attribute is currently being measured */
 #define APP_MEASURING_CURRENT            0
 #define APP_MEASURING_VOLTAGE            1
+#define APP_MEASURING_WITH_DIAG          2
+
+#if APP_MEASURE_ACROSS_IO_INPUTS
+#define APP_MEASURE_RESISTOR_VOLTAGE    0
+#define APP_MEASURE_VDDA_VOLTAGE        1
+#define APP_MEASURE_VOLTAGE_TYPES       2
+#define APP_MEASURE_VOLTAGE_TYPE_FIRST  APP_MEASURE_RESISTOR_VOLTAGE
+#define APP_MEASURE_VOLTAGE_TYPE_LAST   APP_MEASURE_VDDA_VOLTAGE
 
 /* Kelvin to Celcius conversion factor */
 #define APP_CELCIUS_CONVERSION_FACTOR   273.15
@@ -172,7 +163,7 @@ enum {
 /* Following five definitions are setup/thermistor specific.
  * Resistor values are in kOhms. */
 #define APP_RESISTOR_IMPEDENCE          150
-#define APP_THERMISTOR_B_CONSTANT       3797
+#define APP_THERMISTOR_B_CONSTANT       4485	//3797
 #define APP_RESISTANCE_AT_25_DEG_C      220
 #define APP_NOMINAL_TEMP_25_DEG_C       25
 #define APP_T0_VALUE                    (APP_NOMINAL_TEMP_25_DEG_C + APP_CELCIUS_CONVERSION_FACTOR)
@@ -492,6 +483,7 @@ enum {
 
 /* Number of RegisterRead attempts before timeout.
  * It can take as many as 160 attempts to read the OTP.
+ * Must be less than CEM102_MAX_OTP_READ_ATTEMPTS.
  */
 #define OTP_READ_MAX_ATTEMPTS           (160)
 
@@ -507,13 +499,26 @@ enum {
 #warning "Recommended DAC voltage range is from 400 mV to 1.9 V"
 #endif
 
+#if 1
+#define WE1_DAC_V_USER_SETTING          (800+150) /* mV */
+#define WE2_DAC_V_USER_SETTING          (800+150) /* mV */
+#define RE_DAC_V_USER_SETTING           (800) /* mV */
+
+#else
+#define WE1_DAC_V_USER_SETTING          (600) /* mV */
+#define WE2_DAC_V_USER_SETTING          (400) /* mV */
+#define RE_DAC_V_USER_SETTING           (400) /* mV */
+#endif
+
+
 /* Set this to 0 to use DAC voltage 1200 mV during calibration */
 #define USE_LEGACY_WE_SET_CALIBRATION   (1)
 
 /* User may change WE_DAC_TARGET_MV to different value. But calibration
  * uses either legacy value, which is 500 mV or 1200 mV to match
  * OTP factory setting */
-#define APP_LEGACY_CALIB_DAC_VOLTAGE    (500)
+//#define APP_LEGACY_CALIB_DAC_VOLTAGE    (500)
+#define APP_LEGACY_CALIB_DAC_VOLTAGE    (WE1_DAC_V_USER_SETTING)
 
 #if USE_LEGACY_WE_SET_CALIBRATION
 #define APP_CALIB_DAC_TARGET_VOLTAGE    (APP_LEGACY_CALIB_DAC_VOLTAGE)
@@ -525,12 +530,9 @@ enum {
 #define APP_FEMTO_NANO_COV_FACTOR       (1000 * 1000)
 #define APP_FEMTO_PICO_COV_FACTOR       (1000)
 
-
-
 #define APP_VOLTAGE_MV_TO_UV            (1000)
 
-
-#define DIF_DAC_TARGET_MV                	(200)	//(250)
+#define DIF_DAC_TARGET_MV                	(150)	//(250)
 #define REF_DAC_TARGET_MV                	(800)
 
 #define WE1_DAC_TARGET_MV               (REF_DAC_TARGET_MV+DIF_DAC_TARGET_MV)
@@ -546,12 +548,11 @@ enum {
 #define VCC_ICHTRIM_DEFAULT             (VCC_ICHTRIM_96MA)
 #endif
 
-#define LSAD_VIOLATION_FOUND            (1 << 0)
-#define LSAD_VIOLATION_CLEARED          (1 << 1)
+/* Value is same for both channels. Not used anymore */
+#define APP_LSAD_VIOLATION_MODE         (CH1_VIOLATION_CHECK_OVER)
 
-/* Value is same for both channels */
-//#define APP_LSAD_VIOLATION_MODE         (CH1_VIOLATION_CHECK_OVER)
-#define APP_LSAD_VIOLATION_MODE         (0)
+#define APP_LSAD1_VIOLATION_MODE        (CH1_VIOLATION_CHECK_OVER)
+#define APP_LSAD2_VIOLATION_MODE        (CH2_VIOLATION_CHECK_OVER)
 
 /* In femto amps */
 #define CH1_TARGET_VIOLATION_CURRENT    (47106568.0f)
@@ -569,6 +570,14 @@ enum {
 /* Value for LSAD1 and LSAD2 are same */
 #define APP_ORSD_USER_SETTING           (LSAD1_ORSD8192_RSD8 | \
                                          LSAD1_SYS_CHOP_ENABLE)
+
+
+/* ----------------------------------------------------------------------------
+ * user define
+ * --------------------------------------------------------------------------*/
+#define CUSS_ENABLE_TEMPERATURE_CHAR    (1)
+
+#define CUSS_ENABLE_CEM102_POWER_DAC    (1)
 
 /* ----------------------------------------------------------------------------
  * Global variables and types

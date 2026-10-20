@@ -26,6 +26,8 @@
 #define SCHEDULER_MIN_ARRIVAL_TIME           CONVERT_MS_TO_32K_CYCLES(RTC_SLEEP_TIME_5MS)     /**< Minimum time that task can wait to run. */
 #define SCHEDULER_MAX_ARRIVAL_TIME           CONVERT_MS_TO_32K_CYCLES(RTC_SLEEP_TIME_M(30))   /**< Maximum time that task can wait to run. */
 
+#define RTC_COUNT_MAX                        ((uint32_t)(0xFFFFFFFFU))
+
 #define CONN_PARAM_UPDATE_TASK_INTERVAL_S    (7)
 
 /** Function pointer for scheduler task */
@@ -47,6 +49,10 @@ typedef enum
     APP_BASS_MEASURE_TASK_NUM = 0,
     APP_BASS_NTF_TASK_NUM,
     APP_CONN_PARAM_UDPATE_TASK_NUM,
+	APP_TEMPERATURE_TASK_NUM,
+	APP_DAC_POWER_TASK_NUM,
+	APP_CHRONO_A_TASK_NUM,
+	APP_AUTHENTICATION_TASK_NUM,
     APP_TASK_NUM_MAX
 } Task_Numbers_t;
 
@@ -89,6 +95,18 @@ void enable_BASS_Tasks(void);
  * @brief Disable BASS related tasks.
  */
 void disable_BASS_Tasks(void);
+
+void enable_Temperature_Task(void);
+void disable_Temperature_Task(void);
+
+void cem102_dac_power_on_init(void);
+void cem102_dac_power_on_task(void);
+
+void enable_Chrono_A_Task(void);
+void disable_Chrono_A_Task(void);
+
+void enable_Authentication_Task(void);
+void disable_Authentication_Task(void);
 
 /**
  * @brief Create a new task for schedule.
@@ -157,5 +175,4 @@ void Scheduler_Create_Tasks(void);
  * @brief Main part of scheduler.
  */
 void Scheduler_Main(void);
-
 #endif    /* INCLUDE_SCHEDULER_H_ */

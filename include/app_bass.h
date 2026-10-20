@@ -66,12 +66,8 @@ typedef enum _VBAT_Status_t
 #define HIGH_VOLTAGE_CFG_MAX_VOLTAGE_MV  3300
 #define HIGH_VOLTAGE_CFG_MIN_VOLTAGE_MV  2200
 
-/* RSL15 TEMP LSAD Channel */
-#define RSL15_TEMP_CHANNEL               0
-
 /* RSL15 VBAT LSAD Channel */
-#define RSL15_VBAT_CHANNEL               1
-
+#define RSL15_VBAT_CHANNEL               3
 
 /* Factor that VBAT is divided by */
 #define LSAD_VBAT_FACTOR                 2
@@ -100,6 +96,8 @@ typedef enum _VBAT_Status_t
  * battery level was the same.
  * Should be greater than BATT_CHANGE_TIMEOUT_S */
 #define BATT_UPDATE_TIMEOUT_M            3
+
+#define TEMP_UPDATE_TIMEOUT_S            10
 
 /* ----------------------------------------------------------------------------
  * Global variables and types
@@ -145,9 +143,6 @@ void APP_BASS_ReadBattLevelInit(uint32_t trim_error);
  * @brief       Initializes the LSAD configurations.
  */
 void LSAD_ChannelInit(void);
-
-
-uint32_t App_VBAT_Measure(void);
 
 #ifdef __cplusplus
 }
