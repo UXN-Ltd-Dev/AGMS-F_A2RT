@@ -24,16 +24,6 @@ struct ble_sleep_api_param_tag ble_sleep_api_param =
     .max_sleep_duration = MAX_SLEEP_DURATION,
     .min_sleep_duration = MIN_SLEEP_DURATION,
 };
-/* Count number of wake-ups from memory retention sleep */
-
-#define AFE_WAKEUP_WAIT_TIME	2//900				// 900sec = 15min * 60sec
-
-int afe_wakeup_step = 0;
-int afe_wakeup_time = 0;
-static uint32_t afe_start_time = 0;
-
-uint32_t customss_NTF_tmout = 0;
-
 
 volatile uint8_t sleep_mode;
 
@@ -48,6 +38,26 @@ int wakeup_cnt = 0;
 
 /* Mask to get ACS Reset flag from RESET_STATUS_DIG register */
 #define RESET_DIG_STATUS_ACS_RESET_FLAGS_MASK     ((uint32_t)(0x00000001))
+
+static bool App_Sleep_Check(void)
+{
+    bool result = false;
+    RTC_Alarm_Sleep_t rtc_status = RTC_Alarm_Sleep_Check();
+
+    if (((rtc_status == RTC_ALARM_SLEEP_OK) || (rtc_status == RTC_ALARM_DISABLED)) &&
+        ((vbat_status == VBAT_DONE) || (vbat_status == VBAT_IDLE)) &&
+        (CEM102_Sleep_Check()) &&
+#if (BUTTON_MANAGER_ENABLED == 1)
+        (!SWMTRACE_TXINPROGRESS) && !App_ButtonIsPressed())
+#else
+        (!SWMTRACE_TXINPROGRESS))
+#endif
+    {
+        result = true;
+    }
+
+    return result;
+}
 
 void BLE_Sleep_Process(void)
 {
@@ -123,20 +133,19 @@ int main(void)
 
     /* Change RSL15 Sleep mode Sleep with Memory Retention */
     sleep_mode = SLEEP_WKUP_RAM_MODE;
-    measure_status = MEASURE_IDLE;
+    demo_measure_status = MEASURE_IDLE;
     calib_state = CALIB_NOT_STARTED;
 
     irq_valid_flag = 0;
-
-    /* To global value memory allocation and initial */
-    app_device_malloc_attach();
 
     /* To clear minimum threshold sticky bit */
     Sys_Sensor_Disable();
 
     DeviceInit();
 
-    /* ★ 추가: BB Timer를 살리기 위해 sensor interface 다시 활성화 */
+/*******************************************************************************
+ * 추가: BB Timer를 살리기 위해 sensor interface 다시 활성화 ...26.05.11
+ *******************************************************************************/
     Sys_Sensor_Enable();			// 26.05.11
 
     /* Configure RF parameters and initialize the BLE stack */
@@ -166,20 +175,17 @@ int main(void)
     /* Initialize VBAT Status */
     vbat_status = VBAT_IDLE;
 
-    /* Create RTC Scheduler tasks and enable RTC Alarm */
- //   Scheduler_Create_Tasks();		// del sodykim
-
-	/*	add sodykim for data & time */
-    RTC_Clock_Config_Init();
-    afe_start_time = Sys_RTC_Value_Seconds();
-    customss_NTF_tmout = afe_start_time;
+    /* Create RTC Scheduler tasks */
+    Scheduler_Create_Tasks();
 
 #if CUSS_ENABLE_TEMPERATURE_CHAR
     /* Initialize the temperature sensor */
-    App_TempSensor_Init(trim_error);
-#endif /* CUSS_ENABLE_TEMPERATURE_CHAR */
+    App_TempSensor_Init(cem102_demo_trim_error);
+#endif
 
-//    afe_wakeup_step = 1;									// CEM102 Calibration Start..
+#if CUSS_ENABLE_CEM102_POWER_DAC
+    cem102_dac_power_on_init();
+#endif
 
     /* Execute main loop */
     Main_Loop();
@@ -193,37 +199,51 @@ void Main_Loop(void)
     {
         SYS_WATCHDOG_REFRESH();
 
-/**********************************************************************
-  *  CEM102 Measurement
-  **********************************************************************/
-        switch(afe_wakeup_step) {
-        	case 0:
-        	    if ((Sys_RTC_Value_Seconds() - afe_start_time) >= AFE_WAKEUP_WAIT_TIME)	{   // 15분 경과...
-#ifdef SWMTRACE_OUTPUT
-	swmLogInfo("15min elapsed, starting CEM102\r\n");
-#endif
-//					max30123_DAC_power_on();								// DAC POWER ON
-					CUSTOMSS_StartTimer();
+        /***************** RTC WAKEUP and SCHEDULER ****************/
+        if (wakeup_due_to_RTC)	{
+            /* Clear flag for next wake up */
+            wakeup_due_to_RTC = 0;
 
-					Temperature_Cumulative_Initial();						// 15동안 대기를 한 뒤
-        	        afe_wakeup_step = 1;									// CEM102 Calibration Start..
-        	    }
-        		break;
-
-			case 1:
-				max30123_measure_Process();
-				break;
-
-			default:
-				break;
-
+            /* Execute scheduler */
+            Scheduler_Main();
         }
 
 
-/**********************************************************************
-  *  BLE and SLEEP
-  **********************************************************************/
-        BLE_Sleep_Process();
+         /***************** VBAT Measurement ************************/
+        if (vbat_status == VBAT_READ_READY)	{
+            LSAD_ReadVBAT();
+        }
 
+
+         /***************** CEM102 Measurement **********************/
+        if(device_info.cem102_dac_power == CEM102_DAC_POWER_ON) {		// 초기 15분 동안은 DAC 전원을 올리지 않는다...
+#if 1
+			max30123_measure_Process();
+#else
+			if (calib_state == CALIB_DONE)	{
+				CEM102_Operation(cem102);
+
+				/* Must not sleep if CEM102_Restart changed the calib_state */
+				if (calib_state == CALIB_INITIALIZED)	{
+					continue;
+				}
+			}
+			else if (calib_state != CALIB_NOT_STARTED)	{
+				CEM102_Calibrate(cem102);
+			}
+#endif
+        }
+
+
+        /***************** BLE and SLEEP ***************************/
+        if (App_Sleep_Check())	{
+            BLE_Sleep_Process();
+        }
+        else	{
+            if (BLE_Baseband_Is_Awake())	{
+                BLE_Kernel_Process();
+            }
+        }
     }
 }
+
