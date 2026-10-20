@@ -24,71 +24,59 @@
 
 #include "app_max30123.h"
 
-#if APP_MEASURE_ACROSS_IO_INPUTS
-#include "math.h"
-#endif /* APP_MEASURE_ACROSS_IO_INPUTS */
 
 #define APP_EVENT_FROM_CEM102      (1U << 0)
 #define APP_EVENT_THRESH_VIOLATION (1U << 1)
 
+#if CEM102_DIAG_FUNCTIONS
+/* RE DAC voltage isn't measured by by default */
+#define CEM102_MEAS_DAC_VOLTAGES    (CEM102_ENABLE_WE1_V_MEAS | \
+                                     CEM102_ENABLE_WE2_V_MEAS)
+#else /* CEM102_DIAG_FUNCTIONS */
+#define CEM102_MEAS_DAC_VOLTAGES   (0)
+#endif /* CEM102_DIAG_FUNCTIONS */
+
+/* There is no CEM102_ENABLE_WE1 as it is always enabled */
+#define APP_ENABLED_FEATURES       ( \
+                                    CEM102_ENABLE_INTERRUPT | \
+                                    CEM102_ENABLE_WE2 | \
+                                    CEM102_ENABLE_RE | \
+                                    CEM102_MEAS_DAC_VOLTAGES | \
+                                    CEM102_CONNECT_RE_CE | \
+									CEM102_NTC_TO_VDDA \
+                                   )
+
+static uint8_t meas_timer_ok_to_run;
 static uint8_t cem102_event = 0;
-//============================================================================
-// PUBLIC FUNCTION DEFINITIONS
-//============================================================================
-//#define LOG_FLOAT_MARKER "%c%d.%04d"
-
-#define MAX_WEO_LVL_MV			 32767.0f
-#define MIN_WEO_LVL_MV			-32768.0f
-
-#define fA_T0_nA			1000.0f
-
-#define DAC_HIGH_SETTING		1.5f				// 1500mV - 800mV = 700mV
-#define DAC_LOW_SETTING			0.5f				// 500mV - 800mV = -300mV
-
-/**
- * @brief Macro for dissecting a float number into two numbers (integer and residuum).
- */
-#if 0
-#define LOG_FLOAT(val) (val > 0) ?' ':'-', \
-					   (int32_t)(val),     \
-                       (int32_t)(((val > 0) ? (val) - (int32_t)(val)       \
-                       : (int32_t)(val) - (val))*10000)
-#endif
-
 
 /* Globals for Chicopee measurements */
-volatile MEASUREMENT_STATUS_FLAG measure_status;
-uint16_t measure_buf[MEASUREMENT_LENGTH];
+volatile MEASUREMENT_STATUS_FLAG demo_measure_status;
+uint16_t demo_measure_buf[MEASUREMENT_LENGTH];
 uint32_t calib_ref_measurement;
 volatile bool cem102_low_vbat = false;
+static bool vdda_err_handled = false;
+static bool next_measurement_iteration = false;
 
-/* GPIO IRQ detected */
-volatile uint32_t irq = 0;
 volatile uint8_t irq_valid_flag;
 
 volatile Calib_state_t calib_state;
 
-volatile uint32_t vdda_err_counter = 0;
 static volatile uint16_t irq_cfg = 0;
 
-CEM102_RegSaveData saved_regs;
-#if APP_MEASURE_ACROSS_IO_INPUTS
-static int32_t measure_values[APP_MEASURE_VOLTAGE_TYPES];
-static uint8_t voltage_id = APP_MEASURE_OFFSET_VOLTAGE;
-static uint8_t voltage_measurement_age = APP_VOLTAGE_MEASUREMENT_EXPIRY;
+#if APP_MEASURE_ACROSS_IO_INPUTS || CEM102_DIAG_FUNCTIONS
 static uint8_t attribute_under_measure = APP_MEASURING_VOLTAGE;
+#if APP_MEASURE_ACROSS_IO_INPUTS
+static CEM102_RegSaveData saved_regs;
+static int32_t measure_values[APP_MEASURE_VOLTAGE_TYPES];
+static uint8_t voltage_id = APP_MEASURE_VOLTAGE_TYPE_FIRST;
 #endif /* APP_MEASURE_ACROSS_IO_INPUTS */
+#endif /* APP_MEASURE_ACROSS_IO_INPUTS || CEM102_DIAG_FUNCTIONS */
 
 DRIVER_CEM102_t *cem102 = &Driver_CEM102;
 CEM102_TrimStruct trims;
 
 /* Calibration data to be saved as a persistent data */
 CEM102_CalibrationData calib_data;
-
-
-
-//static uint32_t interval_time_count = 0;
-
 
 const CEM102_Device cem102_dut_desc =
 {
@@ -115,35 +103,63 @@ const CEM102_Device cem102_dut_desc =
     .io1_type   = GPIO_MODE_INPUT,
 
     /* Interface configurations */
-    .gpio_cfg   = (GPIO_LPF_DISABLE | GPIO_WEAK_PULL_DOWN | GPIO_3X_DRIVE),
+    .gpio_cfg   = (GPIO_LPF_DISABLE | GPIO_WEAK_PULL_UP  | GPIO_3X_DRIVE),
     .spi_prescale = SPI_PRESCALE_8,
 
     /* Call-back functions */
     .spi_callback = &SPI_CallBack,
     .gpio_callback = &GPIO_CallBack,
+
+    /* Turn on the default features. CEM102_NTC_TO_VDDA is off by default
+     * and CEM102_DC_DAC_16K is off, to set DC DAC frequency to 8 KHz.
+     * WE1 is always enabled. No need to mention here.
+     */
+    .feature = APP_ENABLED_FEATURES,
+
+    /* Sample accumulation setting. Common for both LSADs */
+    .accum_sample_calib = ACCUM_SAMPLE_CNT_8,   /* For calibration */
+    .accum_sample_curr = ACCUM_SAMPLE_CNT_8,    /* For current measurement */
+    .accum_sample_volt = CEM102_ACCUM_SAMPLE_CNT_2, /* For voltage measurement */
+
+    .threshold_detection[CEM102_LSAD1_IDX] = CEM102_THRESH_VIOL_DISABLED,
+    .threshold_detection[CEM102_LSAD2_IDX] = CEM102_THRESH_VIOL_DISABLED,
+
+    .fb_resistance[CEM102_LSAD1_IDX] = CH1_FEEDBACK_RESISTANCE,
+    .fb_resistance[CEM102_LSAD2_IDX] = CH2_FEEDBACK_RESISTANCE,
+    .lpf_cutoff_c[CEM102_LSAD1_IDX] = CEM102_CH1_LPF_CUTOFF_500HZ,
+    .lpf_cutoff_c[CEM102_LSAD2_IDX] = CEM102_CH2_LPF_CUTOFF_500HZ,
+    .lpf_cutoff_v[CEM102_LSAD1_IDX] = CEM102_CH2_LPF_CUTOFF_10KHZ,
+    .lpf_cutoff_v[CEM102_LSAD2_IDX] = CEM102_CH2_LPF_CUTOFF_10KHZ,
+    .lsad_prescale_curr = LSAD_PRESCALE2,
+    .lsad_prescale_volt = LSAD_PRESCALE1,
+
+    .lsad_cfg_user[CEM102_LSAD1_IDX] = LSAD1_ORSD8192_RSD8 | LSAD1_SYS_CHOP_ENABLE |
+                                       LSAD1_ITRIM_1p00 | CH1_LSAD_GAIN_SETTING,
+    .lsad_cfg_user[CEM102_LSAD2_IDX] = LSAD2_ORSD8192_RSD8 | LSAD2_SYS_CHOP_ENABLE |
+                                       LSAD2_ITRIM_1p00 | CH2_LSAD_GAIN_SETTING,
+    .lsad_cfg_calib[CEM102_LSAD1_IDX] = APP_LSAD_NUM_INT_CYCLE | LSAD1_SYS_CHOP_ENABLE |
+                                        LSAD1_ITRIM_1p00 | CH1_LSAD_GAIN_SETTING,
+    .lsad_cfg_calib[CEM102_LSAD2_IDX] = APP_LSAD_NUM_INT_CYCLE | LSAD2_SYS_CHOP_ENABLE |
+                                        LSAD2_ITRIM_1p00 | CH2_LSAD_GAIN_SETTING,
+    .lsad_cfg_volt = LSAD2_ORSD1024_RSD10 | LSAD2_SYS_CHOP_ENABLE |
+                     LSAD2_ITRIM_1p00 | LSAD2_GAIN_UNITY,
+
+    /* With LSADx_ORSD8192_RSD8 setting, when both diagnostics and thermistor
+     * application are enabled, measurements take little more than 10 seconds.
+     *
+     * Tweak according to total measurement time. Timer is disabled by default,
+     * which means measurements are done continuously.
+     */
+    .meas_timer_interval = 0, /* Value in seconds */
 };
 
 const CEM102_Device *cem102_dut = &cem102_dut_desc;
 
-//Jerry
-/*	add sodykim for dac reference */
-typedef struct {
-	uint16_t we1;
-	uint16_t we2;
-	uint16_t ref;
-
-} dac_target_mv_t;
-
-dac_target_mv_t	dac_target_mV;
-
-volatile uint32_t cem102_wait_time = 0;
-
 static uint16_t ch1_violation_count = 0;
 static uint16_t ch2_violation_count = 0;
 
-double we1_current = 1000.0f;
-double we2_current = 1000.0f;
-
+static void Prepare_ThresholdCfg(const CEM102_DAC_TYPE dac,
+                                 uint16_t *p_threshold, uint16_t sample_cnt);
 
 static int Config_SendIdleCommand(void)
 {
@@ -156,6 +172,248 @@ static int Config_SendIdleCommand(void)
                         CH2_COMPLETION_CLR_CMD | BUFFER_RESET_CMD |
                         IDLE_CMD;
     return cem102->SystemCommand(cem102_dut, idle_cmd);
+}
+
+bool CEM102_Sleep_Check(void)
+{
+    bool result = true;
+
+    /* If calibration is done, and measurement is already ready to be read,
+     * do not allow the system go to sleep.*/
+    if (((wakeup_irq != 0) || (demo_measure_status == MEASURE_READING_RESULTS) ||
+        (demo_measure_status == MEASURE_RESULTS_READY)) && (calib_state == CALIB_DONE))
+    {
+        result = false;
+    }
+
+    return result;
+}
+
+bool APP_MeasurementTimerEnabled(void)
+{
+    return (cem102_dut->meas_timer_interval == 0) ? false : true;
+}
+
+static bool APP_ThermistorEnabled(void)
+{
+#if APP_MEASURE_ACROSS_IO_INPUTS
+    return true;
+#else
+    return false;
+#endif
+}
+
+static void APP_ClearMeasureTimerEvent(const CEM102_Device *p_dev, uint8_t ev)
+{
+    ev &= (MEAS_TIMER_OK_TO_RUN_MASK | MEAS_TIMER_STARTED_RUNNING);
+    meas_timer_ok_to_run &= ~ev;
+}
+
+static void APP_SetMeasureAttribute(uint8_t attr)
+{
+#if APP_MEASURE_ACROSS_IO_INPUTS || CEM102_DIAG_FUNCTIONS
+    attribute_under_measure = attr;
+#endif /* APP_MEASURE_ACROSS_IO_INPUTS || CEM102_DIAG_FUNCTIONS */
+}
+
+static bool APP_DiagMeasuresVoltage(const CEM102_Device *p_dev)
+{
+    bool status = false;
+
+#if CEM102_DIAG_FUNCTIONS
+    if ((p_dev != NULL) && (CEM102_MEAS_WE1_VOLTAGE(p_dev) ||
+        CEM102_MEAS_WE2_VOLTAGE(p_dev) || CEM102_MEAS_WE2_VOLTAGE(p_dev)))
+    {
+        status = true;
+    }
+#endif /* CEM102_DIAG_FUNCTIONS */
+    return status;
+}
+
+static bool APP_CurrentOnlyMeasurement(const CEM102_Device *p_dev)
+{
+    bool status = true;
+
+    if ((APP_ThermistorEnabled() || APP_DiagMeasuresVoltage(p_dev)))
+    {
+        status = false;
+    }
+    return status;
+}
+
+static void APP_TIAConfig(DRIVER_CEM102_t *p_cem102,
+                          const CEM102_Device *p_dev, uint32_t idx,
+                          bool require_lsad2)
+{
+    CEM102_DAC_TYPE dac[CEM102_NUM_LSADS] = { WE1, WE2 };
+    uint16_t en[CEM102_NUM_LSADS] = { CH1_TIA_ENABLE, CH2_TIA_ENABLE };
+    uint16_t cfg[CEM102_NUM_LSADS] = { CH1_TIA_INT_FB_ENABLE |
+                                       CH1_FEEDBACK_RESISTANCE,
+                                       CH2_TIA_INT_FB_ENABLE |
+                                       CH2_FEEDBACK_RESISTANCE
+                                     };
+    if ((!require_lsad2) && (!CEM102_WE2_ENABLED(p_dev)))
+    {
+        en[CEM102_WE2_INDEX] = CH2_TIA_DISABLE;
+    }
+    p_cem102->TIAConfig(p_dev, dac[idx], en[idx], cfg[idx]);
+}
+
+static void APP_UpdateChannelConfig(DRIVER_CEM102_t *p_cem102,
+                                    const CEM102_Device *p_dev, uint32_t idx,
+                                    bool require_lsad2, bool measures_voltage)
+{
+    if (idx < CEM102_NUM_LSADS)
+    {
+        APP_TIAConfig(p_cem102, p_dev, idx, require_lsad2);
+
+        CEM102_DAC_TYPE dac[CEM102_NUM_LSADS] = { WE1, WE2 };
+        uint16_t bufcfg[CEM102_NUM_LSADS] = { CH1_BUF_ENABLE, CH2_BUF_ENABLE };
+        uint16_t bias_cur_setting = measures_voltage ?
+                                    CEM102_BIAS_CURR_FOR_V(p_dev, idx) :
+                                    CEM102_BIAS_CURR_FOR_C(p_dev, idx);
+        uint16_t chancfg = measures_voltage ?  p_dev->lpf_cutoff_v[idx] :
+                                               p_dev->lpf_cutoff_c[idx];
+        chancfg |= bias_cur_setting;
+
+        /* When it calibration state, we are not disabling WE2 */
+        if ((!require_lsad2) && (!CEM102_WE2_ENABLED(p_dev)))
+        {
+            bufcfg[CEM102_WE2_INDEX] = CH2_BUF_DISABLE | CH2_BUF_BYPASS_ENABLE;
+        }
+        p_cem102->BufferConfig(p_dev, dac[idx], chancfg, bufcfg[idx]);
+    }
+
+    /* Prescale setting must match the bias setting in chan_cfg above */
+    p_cem102->ClockConfig(p_dev,
+                          measures_voltage ? p_dev->lsad_prescale_volt :
+                          p_dev->lsad_prescale_curr,
+                          LSAD_START_DELAY_50MS);
+}
+
+/* Program uses "in_calibration" to to tell the function whether this function
+ * is being called from calibration module or not. This is needed to
+ * to pass "require_lsad2" flag to APP_UpdateChannelConfig function.
+ */
+static void APP_ChannelConfig(DRIVER_CEM102_t *p_cem102,
+                              const CEM102_Device *p_dev, uint32_t idx,
+                              bool in_calibration, bool measures_voltage)
+{
+    /* During calibration, we require LSAD2 as we use both LSADS.
+     * During measurement, configuration decides the state of LSAD2.
+     * So, "in_calibration" is mapped to "require_lsad2" boolean flag here.
+     */
+    APP_UpdateChannelConfig(p_cem102, p_dev, idx, in_calibration,
+                            measures_voltage);
+
+    CEM102_DAC_TYPE dac[CEM102_NUM_LSADS] = { WE1, WE2 };
+    uint16_t swcfg[CEM102_NUM_LSADS] =
+             {
+                CH1_SC119_SC120_CONNECT | CH1_SC112_CONNECT,
+                CH2_SC219_SC220_CONNECT | CH2_SC212_CONNECT,
+             };
+    p_cem102->SwitchConfig(p_dev, dac[idx], swcfg[idx]);
+
+    uint16_t sample_cnt = (in_calibration) ?
+                           p_dev->accum_sample_calib :
+                           p_dev->accum_sample_curr;
+    uint16_t accum_cfg[CEM102_NUM_LSADS] =
+                            { (CHCFG_CH1_ACCUM_CH1_ACCUM_SAMPLE_CNT_MASK &
+                               sample_cnt) | CH1_MEASUREMENT_ENABLE,
+                              (CHCFG_CH2_ACCUM_CH2_ACCUM_SAMPLE_CNT_MASK &
+                               sample_cnt) | CH2_MEASUREMENT_ENABLE
+                            };
+
+    /* By default, we use CH1_TIA_FB_RES_4M and LSAD1_GAIN_UNITY. This can be
+     * changed to use CH1_TIA_FB_RES_8M + LSAD1_GAIN_DOUBLE, if needed */
+    uint16_t buff_cfg[CEM102_NUM_LSADS] =
+                           { CH1_DOUBLE | (CH1_VIOLATION_LIMIT <<
+                             CHCFG_CH1_BUFFER_CH1_VIOLATION_LIMIT_POS),
+                             CH2_DOUBLE | (CH2_VIOLATION_LIMIT <<
+                             CHCFG_CH2_BUFFER_CH2_VIOLATION_LIMIT_POS)
+                           };
+    uint16_t lsad_cfg = (in_calibration) ?
+                         p_dev->lsad_cfg_calib[idx] :
+                         p_dev->lsad_cfg_user[idx];
+    p_cem102->GetLSADConfig(p_dev, &lsad_cfg, NULL);
+
+    uint16_t thresh_cfg[CEM102_NUM_LSADS] = { 0, 0 };
+    Prepare_ThresholdCfg(dac[idx], thresh_cfg, sample_cnt);
+
+    p_cem102->ADCConfig(p_dev, dac[idx], lsad_cfg, thresh_cfg[idx],
+                        buff_cfg[idx], accum_cfg[idx]);
+
+    /* Recalculate ADC gain, after setting sample accumuation count */
+    p_cem102->CalculateADCGain(dac[idx], (uint32_t)sample_cnt + 1);
+}
+
+#if APP_MEASURE_ACROSS_IO_INPUTS
+static void APP_DisconnectIOInputs(DRIVER_CEM102_t *p_cem102,
+                                   const CEM102_Device *p_dev)
+{
+    if ((p_cem102 != NULL) && (p_dev != NULL))
+    {
+        p_cem102->RE_ATBusSwitchConfig(p_dev, RE,  0);
+        if (!CEM102_WE2_ENABLED(p_dev))
+        {
+            p_cem102->SwitchConfig(p_dev, WE2, 0);
+        }
+    }
+}
+
+static bool APP_MeasuringVoltage(void)
+{
+    return (attribute_under_measure == APP_MEASURING_VOLTAGE) ? true : false;
+}
+
+#endif /* APP_MEASURE_ACROSS_IO_INPUTS */
+
+static bool APP_MeasuringWithDiag(void)
+{
+    bool status = false;
+
+#if CEM102_DIAG_FUNCTIONS
+    status = (attribute_under_measure == APP_MEASURING_WITH_DIAG) ? true : false;
+#endif
+    return status;
+}
+
+/* Returns false, when the function has no action */
+static bool APP_StartMeasurementWithDiag(DRIVER_CEM102_t *p_cem102,
+                                         const CEM102_Device *p_dev)
+{
+    bool status = false;
+
+#if CEM102_DIAG_FUNCTIONS
+    if (APP_DiagMeasuresVoltage(p_dev))
+    {
+        APP_SetMeasureAttribute(APP_MEASURING_WITH_DIAG);
+        CEM102_DiagnosticsAPIInit(p_cem102, p_dev);
+        status = true;
+    }
+#endif /* CEM102_DIAG_FUNCTIONS */
+    return status;
+}
+
+static void APP_StartTheMeasurementTimer(const CEM102_Device *p_dev)
+{
+    ke_timer_set(CEM102_MEASUREMENT_START_TIMEOUT, TASK_APP,
+                 TIMER_SETTING_S(p_dev->meas_timer_interval));
+}
+
+static bool APP_CalibrationValid(DRIVER_CEM102_t *p_cem102)
+{
+    bool result = false;
+    CEM102_CalibrationData *p_calib_data = CEM102_CALIB_DATA_ADDR;
+
+    if ((p_calib_data->dac_v[CEM102_WE1_INDEX] == WE1_DAC_V_USER_SETTING) &&
+        (p_calib_data->dac_v[CEM102_WE2_INDEX] == WE2_DAC_V_USER_SETTING) &&
+        (p_calib_data->dac_v[CEM102_RE_INDEX] == RE_DAC_V_USER_SETTING) &&
+        (p_cem102->CalibrationValid()))
+    {
+        result = true;
+    }
+    return result;
 }
 
 static bool CEM102_ValidStateToMeasure(uint16_t sys_status)
@@ -182,30 +440,24 @@ static void APP_ClearCEM102Event(uint8_t event)
 
 static bool APP_CEM102EventValid(uint8_t event)
 {
-    return (cem102_event & event) ? true : false;
+    return ((cem102_event & event) != 0) ? true : false;
 }
-
-#if APP_MEASURE_ACROSS_IO_INPUTS
-static bool APP_MeasuringVoltage(void)
-{
-    return (attribute_under_measure == APP_MEASURING_VOLTAGE) ? true : false;
-}
-#endif /* APP_MEASURE_ACROSS_IO_INPUTS */
 
 static bool APP_MeasuringCurrent(void)
 {
-#if APP_MEASURE_ACROSS_IO_INPUTS
+#if APP_MEASURE_ACROSS_IO_INPUTS || CEM102_DIAG_FUNCTIONS
     return (attribute_under_measure == APP_MEASURING_CURRENT) ? true : false;
 #else
     return true;
-#endif
+#endif /* APP_MEASURE_ACROSS_IO_INPUTS || CEM102_DIAG_FUNCTIONS */
 }
 
-static bool CEM102_ThreshViolationEnabled(void)
+static bool CEM102_ThreshViolationEnabled(const CEM102_Device *p_dev,
+                                          uint8_t idx)
 {
     bool status = false;
 
-    if ((CEM102_THRESH_VIOL_ENABLED == cem102_threshold_violation) &&
+    if ((CEM102_THRESH_VIOL_ENABLED == p_dev->threshold_detection[idx]) &&
         (calib_state == CALIB_DONE))
     {
         status = true;
@@ -213,40 +465,109 @@ static bool CEM102_ThreshViolationEnabled(void)
     return status;
 }
 
+static void APP_SetChanAccumReg(DRIVER_CEM102_t *p_cem102, CEM102_DAC_TYPE dac,
+                                uint16_t val, uint16_t mask)
+{
+    p_cem102->RegisterReadModifyWrite(cem102_dut,
+                                      (dac == WE2) ? CHCFG_CH2_ACCUM :
+                                      CHCFG_CH1_ACCUM, val, mask);
+}
+
+/* Though CEM102_DAC_TYPE is passed, this function deals with LSAD */
+void CEM102_ChannelCtrl(DRIVER_CEM102_t *p_cem102, CEM102_DAC_TYPE dac,
+                        bool enable)
+{
+    if (((dac == WE1) || (dac == WE2)) && (p_cem102 != NULL))
+    {
+        APP_SetChanAccumReg(p_cem102, dac, enable ? CH1_MEASUREMENT_ENABLE :
+                            CH1_MEASUREMENT_DISABLE,
+                            CHCFG_CH1_ACCUM_CH1_MEASUREMENT_CFG_MASK);
+    }
+}
+
+void CEM102_EnableSingleChannel(DRIVER_CEM102_t *p_cem102, CEM102_DAC_TYPE dac)
+{
+    if (p_cem102 != NULL)
+    {
+        CEM102_DAC_TYPE other_dac = (dac == WE2) ? WE1 : WE2;
+        CEM102_ChannelCtrl(p_cem102, other_dac, false);
+        CEM102_ChannelCtrl(p_cem102, dac, true);
+    }
+}
+
+/* Disables the buffer and measurement if not used */
+static void CEM102_ConfigureLSAD(DRIVER_CEM102_t *p_cem102,
+                                 const CEM102_Device *p_dev,
+                                 CEM102_DAC_TYPE dac, bool enable)
+{
+    /* Disable value is 0, same for both LSADs */
+    uint16_t val = enable ? ((dac == WE2) ?
+                             CH2_BUF_ENABLE : CH1_BUF_ENABLE) :
+                             CH1_BUF_DISABLE;
+    uint16_t mask = (dac == WE2) ?
+                     (1U << ANA_CFG1_CH2_BUF_CFG_POS) :
+                     (1U << ANA_CFG1_CH1_BUF_CFG_POS);
+    p_cem102->RegisterReadModifyWrite(p_dev, ANA_CFG1, val, mask);
+    CEM102_ChannelCtrl(p_cem102, dac, enable);
+}
+
+static void CEM102_ControlNextIteration(DRIVER_CEM102_t *p_cem102,
+                                         const CEM102_Device *p_dev)
+{
+    /* One set of measurements finished. If measurement timer is
+     * running, turn off both LSADs.
+     */
+    if (p_dev->meas_timer_interval != 0)
+    {
+        CEM102_ConfigureLSAD(p_cem102, p_dev, WE1, false);
+
+        if (CEM102_WE2_ENABLED(p_dev) || (!APP_CurrentOnlyMeasurement(p_dev)))
+        {
+            CEM102_ConfigureLSAD(p_cem102, p_dev, WE2, false);
+        }
+    }
+    else
+    {
+        next_measurement_iteration = true;
+    }
+}
+
+static void CEM102_SetupMeasurementCycle(DRIVER_CEM102_t *p_cem102,
+                                         const CEM102_Device *p_dev)
+{
+    if (p_dev->meas_timer_interval != 0)
+    {
+        if (CEM102_WE2_ENABLED(p_dev) || (!APP_CurrentOnlyMeasurement(p_dev)))
+        {
+            CEM102_ConfigureLSAD(p_cem102, p_dev, WE2, true);
+        }
+
+        /* WE1 is always enabled */
+        CEM102_ConfigureLSAD(p_cem102, p_dev, WE1, true);
+    }
+}
+
 /* Measurement can start after some delay, when SINGLE_DELAY_CMD is used. */
 static void CEM102_SetMeasurementDelayTimer(DRIVER_CEM102_t *p_cem102,
                                             uint16_t msec)
 {
+    uint16_t val = LSAD_MEAS_ENABLE;
+    uint16_t mask = 1U << SYSCTRL_AUX_CFG_LSAD_ENABLE_CFG_POS;
+
     msec /= APP_LSAD_MEASURE_DELAY_STEP_SZ;
     if (msec != 0)
     {
-        uint16_t val = msec <<
-                       SYSCTRL_AUX_CFG_SINGLE_DELAY_TIMER_POS;
-        uint16_t mask = SYSCTRL_AUX_CFG_SINGLE_DELAY_TIMER_MASK;
-        p_cem102->RegisterReadModifyWrite(cem102_dut, SYSCTRL_AUX_CFG, val,
-                                          mask);
+        val |= msec <<
+              SYSCTRL_AUX_CFG_SINGLE_DELAY_TIMER_POS;
+        mask |= SYSCTRL_AUX_CFG_SINGLE_DELAY_TIMER_MASK;
     }
-}
-
-/* Until we reach measurement state, we use SINGLE_CMD */
-static uint16_t CEM102_GetMeasurementCmd(DRIVER_CEM102_t *p_cem102)
-{
-    uint16_t cmd = CONTINUOUS_CMD;
-
-    if (calib_state != CALIB_DONE ||
-#if APP_MEASURE_ACROSS_IO_INPUTS
-         APP_MeasuringVoltage() ||
-#endif /* APP_MEASURE_ACROSS_IO_INPUTS */
-        !CEM102_DiagnosticsDone(p_cem102))
-    {
-        cmd = SINGLE_DELAY_CMD;
-    }
-    return cmd;
+    p_cem102->RegisterReadModifyWrite(cem102_dut, SYSCTRL_AUX_CFG, val,
+                                      mask);
 }
 
 static void APP_SystemCommand(DRIVER_CEM102_t *p_cem102)
 {
-    uint16_t cmd = CEM102_GetMeasurementCmd(cem102);
+    uint16_t cmd = SINGLE_DELAY_CMD;
     cmd |= SYSCTRL_CMD_ALL_ERR_MASK;
     p_cem102->SystemCommand(cem102_dut, cmd);
 }
@@ -306,9 +627,9 @@ static void VDDA_ERR_Handler(void)
      * here after the calibration or due to a call to CEM102_Startup.
      * Either way, we are not in measuring state.
      */
-    if (measure_status != MEASURE_INITIALIZED)
+    if (demo_measure_status != MEASURE_INITIALIZED)
     {
-        measure_status = MEASURE_MEASURING;
+        demo_measure_status = MEASURE_MEASURING;
     }
 
     /* Clear the VDDA_ERR and proceed to a new measurement */
@@ -319,7 +640,6 @@ static void VDDA_ERR_Handler(void)
 void GPIO1_IRQHandler(void)
 {
     /* NVIC may be active, when debugger is connected */
-    irq = 1;
 }
 
 void DMA0_IRQHandler(void)
@@ -341,7 +661,7 @@ void SPI_CallBack(uint32_t event)
 {
     /* If we were reading results, copy the SPI data to the measurement buffer
      * and then mark them as ready for processing */
-    if (measure_status == MEASURE_READING_RESULTS)
+    if (demo_measure_status == MEASURE_READING_RESULTS)
     {
         /* During calibration, RegisterMultipleRead API is used that already
          * reads the data off SPI rx buffer. Call to RegisterBufferRead is
@@ -350,11 +670,10 @@ void SPI_CallBack(uint32_t event)
          */
         if (calib_state == CALIB_DONE)
         {
-            cem102->RegisterBufferRead(cem102_dut, measure_buf,
+            cem102->RegisterBufferRead(cem102_dut, demo_measure_buf,
                                        MEASUREMENT_LENGTH);
         }
-
-        measure_status = MEASURE_RESULTS_READY;
+        demo_measure_status = MEASURE_RESULTS_READY;
 
         if (calib_state == CALIB_REF_MEASURING)
         {
@@ -381,14 +700,14 @@ void SPI_CallBack(uint32_t event)
 static void Prepare_ThresholdCfg(const CEM102_DAC_TYPE dac,
                                  uint16_t *p_threshold, uint16_t sample_cnt)
 {
-    uint32_t index = dac - 1;
+    uint32_t index = dac - INDEX_ADJ_HELPER;
 
     /* Channel gain must be non-zero when calibration is done */
     if (channel_gain[index] != 0.0)
     {
-        float limit[2] = { CH1_TARGET_VIOLATION_CURRENT,
-                           CH2_TARGET_VIOLATION_CURRENT
-                         };
+        float limit[CEM102_NUM_LSADS] = { CH1_TARGET_VIOLATION_CURRENT,
+                                          CH2_TARGET_VIOLATION_CURRENT
+                                        };
         uint16_t threshold = (int)((limit[index] / channel_gain[index]) /
                               (sample_cnt + 1))
                                >> CEM102_LSAD_THRESHOLD_PADDING;
@@ -398,10 +717,10 @@ static void Prepare_ThresholdCfg(const CEM102_DAC_TYPE dac,
                              CHCFG_CH1_THRESHOLD_CH1_THRESHOLD_POS) &
                              CHCFG_CH1_THRESHOLD_CH1_THRESHOLD_MASK;
 
-        uint16_t enable[2] = { APP_LSAD_VIOLATION_MODE,
-                               APP_LSAD_VIOLATION_MODE
-                             };
-        if (CEM102_ThreshViolationEnabled())
+        uint16_t enable[CEM102_NUM_LSADS] = { APP_LSAD1_VIOLATION_MODE,
+                                              APP_LSAD2_VIOLATION_MODE
+                                            };
+        if (CEM102_ThreshViolationEnabled(cem102_dut, (uint8_t)index))
         {
             if (APP_MeasuringCurrent() && CEM102_DiagnosticsDone(cem102))
             {
@@ -468,7 +787,6 @@ static void APP_ReadMeasurement(DRIVER_CEM102_t *p_cem102, CEM102_DAC_TYPE dac)
         CH2_COMPLETION,
         CH1_COMPLETION
     };
-
     uint8_t index = (uint8_t)dac - INDEX_ADJ_HELPER;
 
     p_cem102->RegisterRead(cem102_dut, SYS_STATUS, &status);
@@ -478,9 +796,9 @@ static void APP_ReadMeasurement(DRIVER_CEM102_t *p_cem102, CEM102_DAC_TYPE dac)
     if (((status & status_exp[index]) != 0) &&
         ((status & SYS_STATUS_SYS_STATE_MASK) == IDLE_STATE))
     {
-        measure_status = MEASURE_READING_RESULTS;
+        demo_measure_status = MEASURE_READING_RESULTS;
         p_cem102->RegisterMultipleRead(cem102_dut, SYS_BUFFER_WORD0,
-                                       measure_buf, len[index]);
+                                       demo_measure_buf, len[index]);
     }
 }
 
@@ -496,7 +814,7 @@ static int DAC_GetCalibratedSetting(CEM102_DAC_TYPE dac, uint16_t target_mv,
     }
     else
     {
-        uint16_t dac_setting = 0;
+        uint16_t dac_setting = CEM102_INITIAL_VALUE;
         result = cem102->CalculateDACAmplitude(cem102_dut, dac, target_mv,
                                                &dac_setting);
 
@@ -505,12 +823,14 @@ static int DAC_GetCalibratedSetting(CEM102_DAC_TYPE dac, uint16_t target_mv,
         {
             result = cem102->CalculateDACAmplitudeADC(cem102_dut, dac,
                                                       target_mv, &dac_setting);
+#ifdef SWMTRACE_OUTPUT
+            swmLogInfo("DAC-%d calibrated using ADC\r\n", dac);
+#endif /* SWMTRACE_OUTPUT */
         }
-
 #ifdef SWMTRACE_OUTPUT
         swmLogInfo("DAC-%d: CalculateDACAmplitude %d mV returns 0x%x\r\n", dac,
-                   target_mv, dac_setting);
-#endif
+                   (int)target_mv, (uint32_t)dac_setting);
+#endif /* SWMTRACE_OUTPUT */
         *p_dac = dac_setting;
         APP_CEM102_WaitForIdle();
     }
@@ -520,88 +840,45 @@ static int DAC_GetCalibratedSetting(CEM102_DAC_TYPE dac, uint16_t target_mv,
 static int Config_PostCalibration(void)
 {
     int result = ERRNO_NO_ERROR;
-    uint16_t dac_setting = 0;
-
-    uint16_t tia_en[2] = { CH1_TIA_ENABLE, CH2_TIA_ENABLE };
-    uint16_t tia_cfg[2] = { CH1_TIA_INT_FB_ENABLE | CH1_FEEDBACK_RESISTANCE,
-                            CH2_TIA_INT_FB_ENABLE | CH2_FEEDBACK_RESISTANCE
-                          };
+    uint16_t dac_setting = CEM102_INITIAL_VALUE;
     uint16_t dac_mask[2] = { DC_DAC_WE1_CTRL_DAC_WE1_VALUE_MASK,
                              DC_DAC_WE2_CTRL_DAC_WE2_VALUE_MASK
                            };
     uint16_t dac_en[2] = { DAC_WE1_ENABLE, DAC_WE2_ENABLE };
-    uint16_t chan_cfg[2] = { CEM102_CH1_BIAS_PRESCALE2 |
-                             CEM102_CH1_LPF_CUTOFF_500HZ,
-                             CEM102_CH2_BIAS_PRESCALE2 |
-                             CEM102_CH2_LPF_CUTOFF_500HZ
-                           };
-    uint16_t buf_cfg[2] = { CH1_BUF_ENABLE, CH2_BUF_ENABLE };
-    uint16_t sw_cfg[2] = { CH1_SC119_SC120_CONNECT | CH1_SC112_CONNECT,
-                           CH2_SC219_SC220_CONNECT | CH2_SC212_CONNECT,
-                         };
-                
 
-    /* By default, we use CH1_TIA_FB_RES_4M and LSAD1_GAIN_UNITY. This can be
-     * changed to use CH1_TIA_FB_RES_8M + LSAD1_GAIN_DOUBLE, if needed */
-    uint16_t lsad_cfg[2] = { CH1_LSAD_GAIN_SETTING | APP_ORSD_USER_SETTING | LSAD1_ITRIM_1p00,
-                             CH2_LSAD_GAIN_SETTING | APP_ORSD_USER_SETTING | LSAD2_ITRIM_1p00
-                           };
-    uint16_t buff_cfg[2] = { CH1_DOUBLE | (CH1_VIOLATION_LIMIT << CHCFG_CH1_BUFFER_CH1_VIOLATION_LIMIT_POS),
-                             CH2_DOUBLE | (CH2_VIOLATION_LIMIT << CHCFG_CH2_BUFFER_CH2_VIOLATION_LIMIT_POS)
-                           };
-    uint16_t sample_cnt = ACCUM_SAMPLE_CNT_8;
-    uint16_t accum_cfg[2] = { (CHCFG_CH1_ACCUM_CH1_ACCUM_SAMPLE_CNT_MASK & sample_cnt) | CH1_MEASUREMENT_ENABLE,
-                              (CHCFG_CH2_ACCUM_CH2_ACCUM_SAMPLE_CNT_MASK & sample_cnt) | CH2_MEASUREMENT_ENABLE
-                            };
+    dac_en[CEM102_WE2_INDEX] = CEM102_GetDACEnableBit(cem102_dut, WE2);
 
-    for (uint32_t index = 0; index < MAX_WE_CHANNEL_NUM; index++) {
+    /* Make sure that CEM102 is in IDLE mode, before configuring */
+    Config_SendIdleCommand();
+
+    for (uint32_t index = 0; index < MAX_WE_CHANNEL_NUM; index++)
+    {
         int dac = index + 1;
-        if (index == 0)  {
-            dac_setting = calib_data.dac_setting[WE1 - INDEX_ADJ_HELPER];
-        }
-        else {
-            dac_setting = calib_data.dac_setting[WE2 - INDEX_ADJ_HELPER];
-        }
 
-        result |= cem102->TIAConfig(cem102_dut, dac, tia_en[index], tia_cfg[index]);
-        result |= cem102->WEDACConfig(cem102_dut, dac,
-                                      ((dac_mask[index] & dac_setting) |
-                                      dac_en[index]), DC_DAC_LOAD_IRQ_DISABLE);
-        result |= cem102->BufferConfig(cem102_dut, dac, chan_cfg[index],
-                                       buf_cfg[index]);
-        result |= cem102->SwitchConfig(cem102_dut, dac, sw_cfg[index]);
-        result |= cem102->ClockConfig(cem102_dut, LSAD_PRESCALE2,
-                                      LSAD_START_DELAY_50MS);
-        uint16_t thresh_cfg[2] = { 0, 0 };
-        Prepare_ThresholdCfg(dac, thresh_cfg, sample_cnt);
+        /* This is not part of calibration. Passing "false" here */
+        APP_ChannelConfig(cem102, cem102_dut, index, false, true);
 
-        cem102->GetLSADConfig(cem102_dut, &lsad_cfg[index], NULL);
-        result |= cem102->ADCConfig(cem102_dut, dac, lsad_cfg[index],
-                                    thresh_cfg[index], buff_cfg[index],
-                                    accum_cfg[index]);
+        dac_setting = calib_data.dac_setting[index];
 
-         /* Recalculate ADC gain, after setting sample accumuation count */
-         cem102->CalculateADCGain(dac, (uint32_t)sample_cnt + 1);
+        cem102->WEDACConfig(cem102_dut, dac,
+                            ((dac_mask[index] & dac_setting) |
+                            dac_en[index]), DC_DAC_LOAD_IRQ_DISABLE);
     }
 
     /* Restore ANA_CFG2 configuration. */
-    result |= cem102->RegisterReadModifyWrite(cem102_dut, ANA_CFG2,
-                                              SENSOR_CAL_DISABLE,
-                                              ANA_CFG2_SENSOR_CAL_CFG_MASK);
+    cem102->RegisterReadModifyWrite(cem102_dut, ANA_CFG2,
+                                    SENSOR_CAL_DISABLE,
+                                    ANA_CFG2_SENSOR_CAL_CFG_MASK);
 
     /* RE channel enable */
     uint16_t re_dac = (uint16_t)calib_data.dac_setting[RE - INDEX_ADJ_HELPER];
-    result |= cem102->REDACConfig(cem102_dut,
-                                  ((DC_DAC_RE_CTRL_DAC_RE_VALUE_MASK &
-                                  re_dac) | DAC_RE_ENABLE),
-								  RE_SR1_DISCONNECT, RE_BUF_ENABLE);			// RE_SR1_CONNECT --> RE_SR1_DISCONNECT로 변경..25.07.16
-
-#ifdef SWMTRACE_OUTPUT
-        swmLogInfo("Config_PostCalibration : RE %d\r\n", re_dac);
-#endif
-
-
-    result |= Config_SendIdleCommand();
+    uint16_t enable = CEM102_RE_ENABLED(cem102_dut) ? DAC_RE_ENABLE :
+                                        DAC_RE_DISABLE;
+    result = cem102->REDACConfig(cem102_dut,
+                                 ((DC_DAC_RE_CTRL_DAC_RE_VALUE_MASK &
+                                 re_dac) | enable),
+                                 CEM102_SW_SR1_POSITION(cem102_dut),
+                                 RE_BUF_ENABLE);
     return result;
 }
 
@@ -616,10 +893,24 @@ static int Config_ForMeasuring(CEM102_DAC_TYPE dac, uint16_t target_mv)
     }
     else
     {
-        /* DAC RE and RE buf disable */
-        result = cem102->REDACConfig(cem102_dut, 0, 0, 0);
+        /* Set to idle mode before configuring */
+        Config_SendIdleCommand();
 
-        uint32_t index = dac - 1;
+        /* Let us retain, not clear the value of DAC settings */
+        uint16_t val = 0;
+        cem102->RegisterRead(cem102_dut, DC_DAC_RE_CTRL, &val);
+        val &= DC_DAC_RE_CTRL_DAC_RE_VALUE_MASK;
+
+        /* DAC RE and RE buf disable */
+        result = cem102->REDACConfig(cem102_dut, val, 0, 0);
+
+        /* Disable the measurement for the unused channel, while calibrating
+         * a channel. This will expedite the results. Need to re-enable, once
+         * the calibration is over.
+         */
+        CEM102_ChannelCtrl(cem102, (dac == WE2) ? WE1 : WE2, false);
+
+        uint32_t index = dac - INDEX_ADJ_HELPER;
         uint16_t dac_setting = 0;
         if (result == ERRNO_NO_ERROR)
         {
@@ -627,12 +918,8 @@ static int Config_ForMeasuring(CEM102_DAC_TYPE dac, uint16_t target_mv)
                                               &dac_setting);
         }
 
-        uint16_t tia_en[2] = { CH1_TIA_ENABLE, CH2_TIA_ENABLE };
-        uint16_t tia_cfg[2] = { CH1_TIA_INT_FB_ENABLE | CH1_FEEDBACK_RESISTANCE,
-                                CH2_TIA_INT_FB_ENABLE | CH2_FEEDBACK_RESISTANCE
-                              };
-        result |= cem102->TIAConfig(cem102_dut, dac, tia_en[index],
-                                    tia_cfg[index]);
+        /* During calibration, WE2 must be ON. We pass true */
+        APP_ChannelConfig(cem102, cem102_dut, index, true, true);
 
         /* Configure the CEM102 device for a basic measurement */
         uint16_t dac_mask[2] = { DC_DAC_WE1_CTRL_DAC_WE1_VALUE_MASK,
@@ -644,59 +931,6 @@ static int Config_ForMeasuring(CEM102_DAC_TYPE dac, uint16_t target_mv)
                                       ((dac_mask[index] & dac_setting) |
                                       dac_en[index]), 0);
 
-        uint16_t chan_cfg[2] = { CEM102_CH1_BIAS_PRESCALE2 | CEM102_CH1_LPF_CUTOFF_500HZ,
-                                 CEM102_CH2_BIAS_PRESCALE2 | CEM102_CH2_LPF_CUTOFF_500HZ
-                               };
-        uint16_t buf_cfg[2] = { CH1_BUF_ENABLE, CH2_BUF_ENABLE };
-        result |= cem102->BufferConfig(cem102_dut, dac, chan_cfg[index],
-                                       buf_cfg[index]);
-
-        uint16_t conn_cfg[2] = { CH1_SC119_SC120_CONNECT | CH1_SC112_CONNECT,
-                                 CH2_SC219_SC220_CONNECT | CH2_SC212_CONNECT
-                               };
-        result |= cem102->SwitchConfig(cem102_dut, dac, conn_cfg[index]);
-
-        /* Prescale setting must match the bias setting in chan_cfg above */
-        result |= cem102->ClockConfig(cem102_dut, LSAD_PRESCALE2,
-                                      LSAD_START_DELAY_50MS);
-
-        uint16_t lsad_cfg[2] = { CH1_LSAD_GAIN_SETTING | LSAD1_SYS_CHOP_ENABLE |
-                                 APP_LSAD_NUM_INT_CYCLE |  LSAD1_ITRIM_1p00,
-                                 CH2_LSAD_GAIN_SETTING | LSAD2_SYS_CHOP_ENABLE |
-                                 APP_LSAD_NUM_INT_CYCLE | LSAD2_ITRIM_1p00
-                               };
-        uint16_t buff_cfg[2] = { CH1_DOUBLE | (CH1_VIOLATION_LIMIT <<
-                                 CHCFG_CH1_BUFFER_CH1_VIOLATION_LIMIT_POS),
-                                 CH2_DOUBLE | (CH2_VIOLATION_LIMIT <<
-                                 CHCFG_CH2_BUFFER_CH2_VIOLATION_LIMIT_POS)
-                               };
-        uint16_t sample_cnt = ACCUM_SAMPLE_CNT_8;
-        uint16_t accum_cfg[2] = { (CHCFG_CH1_ACCUM_CH1_ACCUM_SAMPLE_CNT_MASK &
-                                   sample_cnt) | CH1_MEASUREMENT_ENABLE,
-                                  (CHCFG_CH2_ACCUM_CH2_ACCUM_SAMPLE_CNT_MASK &
-                                   sample_cnt) | CH2_MEASUREMENT_ENABLE
-                                };
-        uint16_t thresh_cfg[2] = { 0, 0 };
-        Prepare_ThresholdCfg(dac, thresh_cfg, sample_cnt);
-
-        /* Get the config for the ORSD, system chopper state we want */
-        cem102->GetLSADConfig(cem102_dut, &lsad_cfg[index], NULL);
-        result |= cem102->ADCConfig(cem102_dut, dac, lsad_cfg[index],
-                                    thresh_cfg[index], buff_cfg[index],
-                                    accum_cfg[index]);
-
-        /* Recalculate ADC gain, after setting sample accumuation count */
-        cem102->CalculateADCGain(dac, (uint32_t)sample_cnt + 1);
-
-
-        /* RE channel enable */
-        uint16_t re_dac = (uint16_t)calib_data.dac_setting[RE - INDEX_ADJ_HELPER];
-        result |= cem102->REDACConfig(cem102_dut,
-                                      ((DC_DAC_RE_CTRL_DAC_RE_VALUE_MASK &
-                                      re_dac) | DAC_RE_ENABLE),
-									  RE_SR1_DISCONNECT, RE_BUF_ENABLE);			// RE_SR1_CONNECT --> RE_SR1_DISCONNECT로 변경..25.07.16
-
-        result |= Config_SendIdleCommand();
         /* Extra settling time before measuring */
         Sys_Delay(APP_SYS_DELAY_200MS);
     }
@@ -715,7 +949,7 @@ static int Config_PostMeasurement(CEM102_DAC_TYPE dac)
     else
     {
         /* Re-configure internal switches to connect the ADC to the channel. */
-        uint32_t index = dac - 1;
+        uint32_t index = dac - INDEX_ADJ_HELPER;
         uint16_t sw_cfg[2] = { CH1_SC119_SC120_CONNECT | CH1_SC112_CONNECT,
                                CH2_SC219_SC220_CONNECT | CH2_SC212_CONNECT,
                              };
@@ -724,151 +958,248 @@ static int Config_PostMeasurement(CEM102_DAC_TYPE dac)
         /* Restore ANA_CFG2 configuration. */
         result |= cem102->RegisterReadModifyWrite(cem102_dut, ANA_CFG2,
                                                   SENSOR_CAL_DISABLE,
-												  SENSOR_CAL_ENABLE);	//ANA_CFG2_SENSOR_CAL_CFG_MASK);
+                                                  ANA_CFG2_SENSOR_CAL_CFG_MASK);
 
-        result |= Config_SendIdleCommand();
+        Config_SendIdleCommand();
         Sys_Delay(APP_SYS_DELAY_20MS);
     }
     return result;
 }
 
 #if APP_MEASURE_ACROSS_IO_INPUTS
-static int APP_SetupATBusSwitch(uint8_t request)
+static int APP_SetupATBusSwitch(DRIVER_CEM102_t *p_cem102,
+                                const CEM102_Device *p_dev,
+                                uint8_t request)
 {
+    int result = ERRNO_NO_ERROR;
+
+    if (request == APP_MEASURE_VOLTAGE_TYPE_FIRST)
+    {
+        CEM102_ChannelCtrl(p_cem102, WE1, false);
+
+        uint16_t prescale = p_dev->lsad_prescale_volt;
+        uint16_t mask =  CHCFG_LSAD_CLK_LSAD_CLK_PRESCALE_MASK;
+        p_cem102->RegisterReadModifyWrite(p_dev, CHCFG_LSAD_CLK,
+                                          prescale, mask);
+
+        uint16_t chancfg = (prescale == LSAD_PRESCALE1) ?
+                            CEM102_CH2_BIAS_PRESCALE1 :
+                            CEM102_CH2_BIAS_PRESCALE2;
+        chancfg |= p_dev->lpf_cutoff_v[CEM102_LSAD2_IDX];
+
+        uint16_t bufcfg = CH2_BUF_DISABLE | CH2_BUF_BYPASS_ENABLE;
+
+        result = p_cem102->BufferConfig(p_dev, CEM102_VOLTAGE_MEAS_CHAN,
+                                        chancfg, bufcfg);
+        uint16_t swcfg = (CH2_SC209_SC210_DISCONNECT | CH2_SC215_CONNECT |
+                      CH2_SC216_CONNECT);
+        swcfg |= CEM102_WE2_ENABLED(p_dev) ? CH2_SC212_CONNECT :
+                                             CH2_SC212_DISCONNECT;
+        p_cem102->SwitchConfig(p_dev, CEM102_VOLTAGE_MEAS_CHAN, swcfg);
+
+        uint16_t sample_cnt = p_dev->accum_sample_volt;
+        uint16_t lsad_cfg = p_dev->lsad_cfg_volt;
+        uint16_t accum_cfg = (CHCFG_CH2_ACCUM_CH2_ACCUM_SAMPLE_CNT_MASK &
+                              sample_cnt) | CH2_MEASUREMENT_ENABLE;
+        uint16_t buff_cfg = CH2_DOUBLE | (CH2_VIOLATION_LIMIT <<
+                            CHCFG_CH2_BUFFER_CH2_VIOLATION_LIMIT_POS);
+
+        uint16_t thresh_cfg[CEM102_NUM_LSADS] = { 0, 0 };
+
+        Prepare_ThresholdCfg(CEM102_VOLTAGE_MEAS_CHAN, thresh_cfg, sample_cnt);
+
+        /* Get the config for the ORSD, system chopper state we want */
+        p_cem102->GetLSADConfig(p_dev, &lsad_cfg, NULL);
+        p_cem102->ADCConfig(p_dev, CEM102_VOLTAGE_MEAS_CHAN, lsad_cfg,
+                            thresh_cfg[CEM102_WE2_INDEX], buff_cfg, accum_cfg);
+
+        /* Recalculate ADC gain, after changing sample count */
+        p_cem102->CalculateADCGain(CEM102_VOLTAGE_MEAS_CHAN,
+                                   (uint32_t)sample_cnt + 1);
+    }
+
     /* Default setting is for the APP_MEASURE_RESISTOR_VOLTAGE request */
-    uint16_t cfg = CEM102_ANALOG_IO_ATBUS_CONNECT |
-                   CEM102_ANALOG_IO2_VSSA_CONNECT;
+    uint16_t cfg = CEM102_ANALOG_IO_ATBUS_CONNECT;
 
-    int result = cem102->BufferConfig(cem102_dut, WE2,
-                                      CEM102_CH2_LPF_CUTOFF_10KHZ,
-                                      CH2_BUF_ENABLE | CH2_BUF_BYPASS_ENABLE);
-    result |= cem102->SwitchConfig(cem102_dut, WE2,
-                                   CH2_SC209_SC210_DISCONNECT |
-                                   CH2_SC217_SC218_CONNECT |
-                                   CH2_SC212_CONNECT
-                                  );
-    uint16_t sample_cnt = CEM102_ACCUM_SAMPLE_CNT_2;
-    uint16_t lsad_cfg = LSAD2_GAIN_UNITY | LSAD2_SYS_CHOP_DISABLE |
-                        LSAD2_ORSD64_RSD14 | LSAD2_ITRIM_1p00;
-    uint16_t accum_cfg = (CHCFG_CH2_ACCUM_CH2_ACCUM_SAMPLE_CNT_MASK &
-                          sample_cnt) | CH2_MEASUREMENT_ENABLE;
-    uint16_t buff_cfg = CH2_DOUBLE | (CH2_VIOLATION_LIMIT <<
-                        CHCFG_CH2_BUFFER_CH2_VIOLATION_LIMIT_POS);
-
-    uint16_t thresh_cfg[2] = { 0, 0 };
-
-    Prepare_ThresholdCfg(WE2, thresh_cfg, sample_cnt);
-
-    /* Get the config for the ORSD, system chopper state we want */
-    cem102->GetLSADConfig(cem102_dut, &lsad_cfg, NULL);
-    result |= cem102->ADCConfig(cem102_dut, WE2, lsad_cfg, thresh_cfg[1],
-                                buff_cfg, accum_cfg);
-
-    /* Recalculate ADC gain, after changing sample count */
-    cem102->CalculateADCGain(WE2, (uint32_t)sample_cnt + 1);
+    if (CEM102_NTC_VDDA_CONNECTED(p_dev))
+    {
+        cfg |= CEM102_ANALOG_IO2_VSSA_CONNECT;
+    }
+    else
+    {
+        cfg |= CEM102_ANALOG_IO2_VDDA_CONNECT;
+    }
 
     if (request == APP_MEASURE_VDDA_VOLTAGE)
     {
-        cfg |= CEM102_ANALOG_IO1_VDDA_CONNECT;
+       if (CEM102_NTC_VDDA_CONNECTED(p_dev))
+       {
+           cfg |= CEM102_ANALOG_IO1_VDDA_CONNECT;
+       }
+       else
+       {
+           cfg |= CEM102_ANALOG_IO1_VSSA_CONNECT;
+       }
     }
-    else if (request == APP_MEASURE_OFFSET_VOLTAGE)
+    if (result == ERRNO_NO_ERROR)
     {
-        cfg |= CEM102_ANALOG_IO1_VSSA_CONNECT;
+        result = p_cem102->RE_ATBusSwitchConfig(p_dev, RE, cfg);
     }
-    result |= cem102->RE_ATBusSwitchConfig(cem102_dut, RE, cfg);
     return result;
 }
 
-static void APP_CalculateTemperature(void)
+static void APP_CalculateTemperature(DRIVER_CEM102_t *p_cem102,
+                                     const CEM102_Device *p_dev)
 {
-    /* Subtract the offset voltage, to improve accuracy */
-    float v_vdda = (float)measure_values[APP_MEASURE_VDDA_VOLTAGE] -
-                   (float)measure_values[APP_MEASURE_OFFSET_VOLTAGE];
-    float v_res = (float)measure_values[APP_MEASURE_RESISTOR_VOLTAGE] -
-                   (float)measure_values[APP_MEASURE_OFFSET_VOLTAGE];
+    APP_NotifyThermistorData(p_cem102, p_dev,
+                             measure_values[APP_MEASURE_VDDA_VOLTAGE],
+                             measure_values[APP_MEASURE_RESISTOR_VOLTAGE]);
 
-    /* Add voltage across two switches, ST12 and ST22. */
-    v_vdda += (2 * v_vdda * CEM102_ST_SWITCH_RESISTANCE) /
-               (1000 * APP_RESISTOR_IMPEDENCE);
-    if (v_res != 0)
-    {
-        /* In Fahrenheit scale */
-        float temperature_measured = 0.0;
-        float resistance = APP_RESISTOR_IMPEDENCE *
-                            ((v_vdda / v_res) - 1);
-
-        /* To calculate temperature from resistance, we use simplified
-         * B-parameter equation, derived from Steinhart-Hart equation
-         *
-         *   1/T = (1/T0) + (1/B) * log(R/R0) simplified as
-         *   T = (B * T0) / (B + (T0 * log(R/R0)))
-         */
-        temperature_measured = APP_THERMISTOR_B_CONSTANT * APP_T0_VALUE;
-        temperature_measured /= (APP_THERMISTOR_B_CONSTANT + (APP_T0_VALUE *
-                                 log(resistance / APP_RESISTANCE_AT_25_DEG_C)));
-        temperature_measured -= APP_CELCIUS_CONVERSION_FACTOR;
-#ifdef SWMTRACE_OUTPUT
-        swmLogInfo("Resistance %f kilo ohms, Temperature = %f deg C\r\n",
-                    resistance, temperature_measured);
-#endif
-        temperature = App_Utils_ConvertFloatToUInt32(temperature_measured);
-    }
+    /* Thermistor part is over. Disconnect the IO1 & IO2 pins */
+    APP_DisconnectIOInputs(p_cem102, p_dev);
 }
 #endif /* APP_MEASURE_ACROSS_IO_INPUTS */
 
-static void CEM102_SetThreshViolDetection(int ch1_enable, int ch2_enable)
+static void CEM102_SetThreshViolDetection(bool ch1_enable, bool ch2_enable)
 {
-    if (CEM102_ThreshViolationEnabled())
+    bool flags[CEM102_NUM_LSADS];
+    uint16_t mode[CEM102_NUM_LSADS] = { APP_LSAD1_VIOLATION_MODE,
+                                        APP_LSAD2_VIOLATION_MODE
+                                      };
+    uint16_t mask[CEM102_NUM_LSADS] = { CHCFG_CH1_THRESHOLD_CH1_VIOLATION_CFG_MASK,
+                                        CHCFG_CH2_THRESHOLD_CH2_VIOLATION_CFG_MASK
+                                      };
+    uint8_t reg[CEM102_NUM_LSADS] = { CHCFG_CH1_THRESHOLD,
+                                      CHCFG_CH2_THRESHOLD
+                                    };
+
+    flags[CEM102_LSAD1_IDX] = ch1_enable;
+    flags[CEM102_LSAD2_IDX] = ch2_enable;
+
+    for (uint8_t idx = 0; idx < CEM102_NUM_LSADS; idx++)
     {
-        uint16_t ch1_val = CH1_VIOLATION_CHECK_DISABLE;
-        uint16_t ch2_val = CH2_VIOLATION_CHECK_DISABLE;
-        uint16_t ch1_mask = CHCFG_CH1_THRESHOLD_CH1_VIOLATION_CFG_MASK;
-        uint16_t ch2_mask = CHCFG_CH2_THRESHOLD_CH2_VIOLATION_CFG_MASK;
-
-#ifdef SWMTRACE_OUTPUT
-        swmLogInfo("CEM102_SetThreshViolDetection : %d  %d \r\n", ch1_enable, ch2_enable);
-#endif
-
-
-        if (ch1_enable)
+        if (CEM102_ThreshViolationEnabled(cem102_dut, idx))
         {
-            ch1_val = APP_LSAD_VIOLATION_MODE;
+            /* Value for both channels are same */
+            uint16_t val = flags[idx] ? mode[idx] : CH1_VIOLATION_CHECK_DISABLE;
+            cem102->RegisterReadModifyWrite(cem102_dut, reg[idx], val, mask[idx]);
         }
-        if (ch2_enable)
-        {
-            ch2_val = APP_LSAD_VIOLATION_MODE;
-        }
-        cem102->RegisterReadModifyWrite(cem102_dut, CHCFG_CH1_THRESHOLD,
-                                        ch1_val, ch1_mask);
-        cem102->RegisterReadModifyWrite(cem102_dut, CHCFG_CH2_THRESHOLD,
-                                        ch2_val, ch2_mask);
     }
+}
+
+/* When chan is passed with RE, it is WE1 */
+void CEM102_GetValueFromBuffer(uint32_t chan, uint32_t *p_data)
+{
+    if (p_data != NULL)
+    {
+        uint8_t lsb_index = APP_WE1_LOWER_HALF_WORD;
+        uint8_t msb_index = APP_WE1_UPPER_HALF_WORD;
+
+        if (WE2 == chan)
+        {
+            lsb_index = APP_WE2_LOWER_HALF_WORD;
+            msb_index = APP_WE2_UPPER_HALF_WORD;
+        }
+        *p_data = (uint32_t)demo_measure_buf[msb_index];
+        *p_data <<= CEM102_SHIFT_FOR_WORD;
+        *p_data |= (uint32_t)demo_measure_buf[lsb_index];
+    }
+}
+
+static void APP_GetThreshViolationState(const CEM102_Device *p_dev,
+                                        bool flags[])
+{
+    for (uint8_t idx = 0; idx < CEM102_NUM_LSADS; idx++)
+    {
+        flags[idx] = false;
+        if (CEM102_ThreshViolationEnabled(p_dev, idx))
+        {
+            flags[idx] = true;
+        }
+    }
+}
+
+static void APP_EnableThresholdViolation(DRIVER_CEM102_t *p_cem102,
+                                         const CEM102_Device *p_dev)
+{
+    bool flags[CEM102_NUM_LSADS] = { false, false };
+
+    APP_GetThreshViolationState(p_dev, flags);
+    CEM102_SetThreshViolDetection(flags[CEM102_LSAD1_IDX],
+                                  flags[CEM102_LSAD2_IDX]);
+}
+
+static void APP_ConfigCurrentThresholdViolation(const CEM102_Device *p_dev)
+{
+    /* In the right state to handle the interrupts. Enabling them. */
+    uint16_t mask = SYSCTRL_IRQ_CFG_VDDA_ERR_IRQ_CFG_MASK |
+                    SYSCTRL_IRQ_CFG_STATE_ERR_IRQ_CFG_MASK |
+                    SYSCTRL_IRQ_CFG_DIGITAL_RESET_IRQ_CFG_MASK |
+                    SYSCTRL_IRQ_CFG_CH1_VIOLATION_IRQ_CFG_MASK |
+                    SYSCTRL_IRQ_CFG_CH2_VIOLATION_IRQ_CFG_MASK;
+    uint16_t data = VDDA_ERR_IRQ_ENABLE | STATE_ERR_IRQ_ENABLE |
+                    DIGITAL_RESET_IRQ_ENABLE;
+
+    /* Enable the threshold violation detection, if enabled */
+    bool flags[CEM102_NUM_LSADS] = { false, false };
+    APP_GetThreshViolationState(p_dev, flags);
+
+    data |= flags[CEM102_LSAD1_IDX] ? CH1_VIOLATION_IRQ_ENABLE :
+                                      CH1_VIOLATION_IRQ_DISABLE;
+    data |= flags[CEM102_LSAD2_IDX] ? CH2_VIOLATION_IRQ_ENABLE :
+                                      CH2_VIOLATION_IRQ_DISABLE;
+
+    APP_EnableThresholdViolation(cem102, p_dev);
+
+    /* Ready to proess interrupts. Time to enable them. */
+    cem102->RegisterReadModifyWrite(p_dev, SYSCTRL_IRQ_CFG,
+                                    data, mask);
 }
 
 static void CEM102_SetCalibDone(void)
 {
     calib_state = CALIB_DONE;
-    measure_status = MEASURE_INITIALIZED;
-    CEM102_SetThreshViolDetection(false, false);
+    demo_measure_status = MEASURE_INITIALIZED;
+
+    if (APP_MeasuringCurrent())
+    {
+        APP_ConfigCurrentThresholdViolation(cem102_dut);
+    }
+    else
+    {
+        CEM102_SetThreshViolDetection(false, false);
+    }
 }
 
-static void CEM102_Restart(DRIVER_CEM102_t *cem102, bool restart)
+static void CEM102_Restart(DRIVER_CEM102_t *p_cem102, bool restart)
 {
     /* Local variable definitions */
     int result = ERRNO_NO_ERROR;
-
-#if 0
     uint16_t fam = 0;
-#endif
-
 
 #ifdef SWMTRACE_OUTPUT
-//    uint16_t rev = 0;
+    uint16_t rev = 0;
     uint32_t repeat_count = 0;
 #endif
+    const CEM102_Device *p_dev = cem102_dut;
+
+    if (restart)
+    {
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("\rStopping the timer, if already running\r\n");
+#endif /* SWMTRACE_OUTPUT */
+        ke_timer_clear(CEM102_MEASUREMENT_START_TIMEOUT, TASK_APP);
+        APP_ClearMeasureTimerEvent(p_dev, MEAS_TIMER_STARTED_RUNNING |
+                                   MEAS_TIMER_OK_TO_RUN_INIT);
+
+        /* We are here on error. Clear the state to mark that we are not
+         * ready for measurement. */
+        p_cem102->NotifyEvent(p_dev, false, CEM102_APP_EV_MEASURE_PHASE, NULL);
+    }
 
     do
     {
+        result = ERRNO_NO_ERROR;
         SYS_WATCHDOG_REFRESH();
 
 #ifdef SWMTRACE_OUTPUT
@@ -881,31 +1212,35 @@ static void CEM102_Restart(DRIVER_CEM102_t *cem102, bool restart)
         Sys_Delay(APP_SYS_DELAY_20MS);
 
         /* Initialize the CEM102 device */
-        result = cem102->Initialize(cem102_dut);
-        cem102->VDDCCharge(cem102_dut);
-        result |= cem102->PowerReset(cem102_dut);
+        p_cem102->Initialize(cem102_dut);
+        p_cem102->VDDCCharge(cem102_dut);
+        result = p_cem102->PowerReset(cem102_dut);
 
         if (result == ERRNO_VCC_LOW_ERROR)
         {
             cem102_err_status |= CS0_CEM102_ERR_VCC_LOW;
         }
+        else
+        {
+            result = p_cem102->PowerInit(cem102_dut);
+        }
 
-        result |= cem102->PowerInit(cem102_dut);
-#if 1
-        // MAX30132 POWER On READY
+#if 1		// MAX30123 INITIAL
         max30123_power_on_ready();
 
         swmLogInfo("max30123_reg_initial\r\n");
         max30123_reg_initial();
 
+
 #else
+
         if (result == ERRNO_NO_ERROR)
         {
             uint16_t temp = 0;
 
             Config_SendIdleCommand();
 
-            cem102->RegisterRead(cem102_dut, SYS_STATUS, &temp);
+            p_cem102->RegisterRead(cem102_dut, SYS_STATUS, &temp);
 #ifdef SWMTRACE_OUTPUT
             swmLogInfo("\rSYS_STATUS(%X)\r\n", temp);
 #endif /* SWMTRACE_OUTPUT */
@@ -920,11 +1255,11 @@ static void CEM102_Restart(DRIVER_CEM102_t *cem102, bool restart)
         if (result == ERRNO_NO_ERROR)
         {
             /* Read the chip family information */
-            result = cem102->RegisterRead(cem102_dut, CHIP_FAMILY_VERSION, &fam);
+            result = p_cem102->RegisterRead(cem102_dut, CHIP_FAMILY_VERSION, &fam);
 
             if ((result != ERRNO_NO_ERROR) || (0 == fam))
             {
-                result |= ERRNO_GENERAL_FAILURE;
+                result = ERRNO_GENERAL_FAILURE;
 #ifdef SWMTRACE_OUTPUT
                 swmLogInfo("\r\nFailed to read chip version\r\n");
 #endif /* SWMTRACE_OUTPUT */
@@ -932,7 +1267,7 @@ static void CEM102_Restart(DRIVER_CEM102_t *cem102, bool restart)
             else
             {
 #ifdef SWMTRACE_OUTPUT
-                result |= cem102->RegisterRead(cem102_dut, CHIP_REVISION, &rev);
+                result = p_cem102->RegisterRead(cem102_dut, CHIP_REVISION, &rev);
                 swmLogInfo("- Chip Revision: %X (%X)\r\n", fam, rev);
 #endif /* SWMTRACE_OUTPUT */
             }
@@ -941,7 +1276,7 @@ static void CEM102_Restart(DRIVER_CEM102_t *cem102, bool restart)
         if (result == ERRNO_NO_ERROR)
         {
             /* Read OTP data */
-            result = cem102->OTPRead(cem102_dut, &trims, INTERNAL_RC_CLK_FREQUENCY,
+            result = p_cem102->OTPRead(cem102_dut, &trims, INTERNAL_RC_CLK_FREQUENCY,
                                      OTP_READ_MAX_ATTEMPTS);
 
             if (result == ERRNO_NO_ERROR)
@@ -980,13 +1315,12 @@ static void CEM102_Restart(DRIVER_CEM102_t *cem102, bool restart)
 #endif
             }
         }
-
 #endif
 
         if (result == ERRNO_NO_ERROR)
         {
             /* Load Device Trim */
-            result |= cem102->DeviceTrim(cem102_dut, &trims);
+            result = p_cem102->DeviceTrim(cem102_dut, &trims);
         }
     } while (result != ERRNO_NO_ERROR);
 
@@ -995,19 +1329,20 @@ static void CEM102_Restart(DRIVER_CEM102_t *cem102, bool restart)
     swmLogInfo("Measurement has been configured; enabling calibration.\r\n");
 #endif /* SWMTRACE_OUTPUT */
 
+
     /* Enable CH1 & CH2 Completion IRQ */
     uint16_t temp = 0;
-    result = cem102->RegisterRead(cem102_dut, SYSCTRL_IRQ_CFG, &temp);
+    result = p_cem102->RegisterRead(cem102_dut, SYSCTRL_IRQ_CFG, &temp);
     if (result == ERRNO_NO_ERROR)
     {
         temp |= (CH1_COMPLETION_IRQ_ENABLE |
                  CH2_COMPLETION_IRQ_ENABLE);
-        cem102->IRQConfig(cem102_dut, temp);
+        p_cem102->IRQConfig(cem102_dut, temp);
     }
 
     /* Start calibration */
     calib_state = CALIB_INITIALIZED;
-    measure_status = MEASURE_INITIALIZED;
+    demo_measure_status = MEASURE_INITIALIZED;
 
 #if CEM102_DIAG_FUNCTIONS
     /* This will cause the diagnostics module to re-initialize */
@@ -1015,45 +1350,52 @@ static void CEM102_Restart(DRIVER_CEM102_t *cem102, bool restart)
 #endif /* CEM102_DIAG_FUNCTIONS */
 }
 
+/* Put 100ms Delay for the voltage to settle*/
+static void CEM102_RestartWithDelay(DRIVER_CEM102_t *p_cem102, bool flag)
+{
+    Sys_Delay(APP_SYS_DELAY_100MS);
+    CEM102_Restart(p_cem102, flag);
+}
+
+uint16_t CEM102_GetDACEnableBit(const CEM102_Device *p_dev, CEM102_DAC_TYPE dac)
+{
+    /* Value of ENABLE / DISBLE bit is same for all DACS. */
+    uint16_t we_en = DAC_WE1_ENABLE;
+
+    if (((dac == RE) && (!CEM102_RE_ENABLED(p_dev))) ||
+        ((dac == WE2) && (!CEM102_WE2_ENABLED(p_dev))))
+    {
+        we_en = DAC_WE1_DISABLE;
+    }
+    return we_en;
+}
+
 void CEM102_Startup(DRIVER_CEM102_t *p_cem102)
 {
-    /* Put 100ms Delay for the voltage to settle*/
-    Sys_Delay(APP_SYS_DELAY_100MS);
-
 #ifdef SWMTRACE_OUTPUT
     swmLogInfo("\rCEM102_Startup\r\n");
 #endif /* SWMTRACE_OUTPUT */
-
-    CEM102_Restart(p_cem102, false);
+    CEM102_RestartWithDelay(p_cem102, false);
 }
 
-int CEM102_Calibrate(DRIVER_CEM102_t *cem102)
+int CEM102_Calibrate(DRIVER_CEM102_t *p_cem102)
 {
     uint32_t cal_measurement = 0;
     int result = ERRNO_NO_ERROR;
-//    uint16_t target_mv = APP_CALIB_DAC_TARGET_VOLTAGE;
-    static uint16_t dac_setting_re = 0;
-
-    uint16_t dac_setting[CEM102_MAX_DACS] = { 0 };
+    uint16_t target_mv = APP_CALIB_DAC_TARGET_VOLTAGE;
     bool vcc_valid_data = false;
-    static uint16_t new_vcc_trim = 0;
-
-//    dac_target_mV.we1 = WE1_DAC_TARGET_MV;
-    dac_target_mV.we1 = REF_DAC_TARGET_MV;					// WE1은 전류가 흐르지 않게 한다...테스트 용...
-    dac_target_mV.we2 = WE2_DAC_TARGET_MV;
-    dac_target_mV.ref = REF_DAC_TARGET_MV;
+    const CEM102_Device *p_dev = cem102_dut;
+    static uint32_t new_vcc_trim = 0;
 
     if (calib_state == CALIB_INITIALIZED)
     {
         CEM102_CalibrationData *p_data = CEM102_CALIB_DATA_ADDR;
+        uint32_t stored_vcc_trim = 0;
 
         if (cem102_dut->pwr_cfg == LOW_VOLTAGE)
         {
-            /* Read the current VCC Trim */
-            uint32_t vcc_trim = (ACS->VCC_CTRL & ACS_VCC_CTRL_VTRIM_Mask);
-
             /* Discharge VDDA down to its trimmed value of 2.3 */
-            cem102->VDDADischarge(cem102_dut, VDDA_DISCHARGE_TIME_MS);
+            p_cem102->VDDADischarge(cem102_dut, VDDA_DISCHARGE_TIME_MS);
 
             /* If there is a valid vcc calibration data stored in the flash,
              * load that data for channel configurations. If not, proceed
@@ -1065,10 +1407,20 @@ int CEM102_Calibrate(DRIVER_CEM102_t *cem102)
              * and run calibration every time device is powered up/initialized.
              */
             vcc_valid_data = CEM102_VCC_Calibration_Valid();
-            if (!vcc_valid_data)
+
+            /* Empty flash will have 0xFF */
+            if (p_data->vcc_trim != 0xFFFF)
             {
+                stored_vcc_trim = p_data->vcc_trim &
+                                        ACS_VCC_CTRL_VTRIM_Mask;
+            }
+            if ((!vcc_valid_data) || (stored_vcc_trim == 0))
+            {
+                /* Read the current VCC Trim */
+                uint32_t vcc_trim = (ACS->VCC_CTRL & ACS_VCC_CTRL_VTRIM_Mask);
+
                 /* Calibrate VCC to 1250 mV */
-                cem102->CalibrateVCC(cem102_dut, vcc_trim, VCC_TYPICAL);
+                p_cem102->CalibrateVCC(cem102_dut, vcc_trim, VCC_TYPICAL);
 
                 new_vcc_trim = (ACS->VCC_CTRL & ACS_VCC_CTRL_VTRIM_Mask) >>
                                 ACS_VCC_CTRL_VTRIM_Pos;
@@ -1079,24 +1431,22 @@ int CEM102_Calibrate(DRIVER_CEM102_t *cem102)
             }
             else
             {
-                uint8_t stored_vcc_trim = (uint8_t)(p_data->vcc_trim);
 #ifdef SWMTRACE_OUTPUT
                 swmLogInfo("VCC Calibration trim found in the flash:%x\r\n",
                            stored_vcc_trim);
 #endif /* SWMTRACE_OUTPUT */
                 Sys_ACS_WriteRegister(&ACS->VCC_CTRL,
                                      (ACS->VCC_CTRL & ~ACS_VCC_CTRL_VTRIM_Mask)
-                                     | (stored_vcc_trim <<
-                                        ACS_VCC_CTRL_VTRIM_Pos));
+                                     | stored_vcc_trim);
             }
 
         }
 
         /* Enable the VBAT VDDA monitor after VCC is calibrated */
-        cem102->VBAT_VDDAMonitorStart(cem102_dut, WE1,
+        p_cem102->VBAT_VDDAMonitorStart(cem102_dut, WE1,
                                       SENSOR_THRESHOLD_MIN_THRESHOLD_MIN);
 
-        CEM102_SetMeasurementDelayTimer(cem102, APP_LSAD_MEASURE_DELAY_48MS);
+        CEM102_SetMeasurementDelayTimer(p_cem102, APP_LSAD_MEASURE_DELAY_48MS);
 
         /* If there is a valid calibration data stored in the flash, load that
          * data for channel configurations. If not, proceed with the
@@ -1106,241 +1456,218 @@ int CEM102_Calibrate(DRIVER_CEM102_t *cem102)
          * values of the calibration data and run calibration every time
          * device is powered up/initialized.
          */
-
-#if 0	// 25.07.21
-        if (cem102->CalibrationValid())
+#if 0
+        if (APP_CalibrationValid(p_cem102))
         {
-            if (vcc_valid_data)
-            {
-                calib_data.dac_setting[WE1 - INDEX_ADJ_HELPER] =
-                                        p_data->dac_setting[WE1 - INDEX_ADJ_HELPER];
-                calib_data.dac_setting[WE2 - INDEX_ADJ_HELPER] =
-                                        p_data->dac_setting[WE2 - INDEX_ADJ_HELPER];
-                calib_data.dac_setting[RE - INDEX_ADJ_HELPER] =
-                                        p_data->dac_setting[RE - INDEX_ADJ_HELPER];
+            /* Copy the incoming calibration data */
+            memcpy(&calib_data, p_data, CEM102_CALIB_DATA_SZ);
 
-                channel_gain[WE1 - INDEX_ADJ_HELPER] = p_data->gain[WE1 - INDEX_ADJ_HELPER];
-                channel_gain[WE2 - INDEX_ADJ_HELPER] = p_data->gain[WE2 - INDEX_ADJ_HELPER];
-
+            channel_gain[CEM102_WE1_INDEX] = p_data->gain[CEM102_WE1_INDEX];
+            channel_gain[CEM102_WE2_INDEX] = p_data->gain[CEM102_WE2_INDEX];
 #ifdef SWMTRACE_OUTPUT
-                swmLogInfo("Valid Calibration data found in the flash.\r\n");
+            swmLogInfo("Valid Calibration data found in the flash.\r\n");
 #endif /* SWMTRACE_OUTPUT */
-            }
-            else
+            if ((!vcc_valid_data) || (stored_vcc_trim == 0))
             {
-                /* Copy the incoming calibration data */
-                memcpy(&calib_data, p_data, CEM102_CALIB_DATA_SZ);
-
                 calib_data.vcc_trim = new_vcc_trim;
 
                 /* Save calibration data to the flash */
-                result |= cem102->CalibrationSave(&calib_data);
+                result = p_cem102->CalibrationSave(&calib_data);
             }
-
             CEM102_SetCalibDone();
 
             /* Configure switches for the measurement */
-            result |= Config_PostCalibration();
-
+            result = Config_PostCalibration();
         }
         else
 #endif
+
         {
 #ifdef SWMTRACE_OUTPUT
             swmLogInfo("Start Calibration.\r\n");
 #endif /* SWMTRACE_OUTPUT */
-
-            measure_status = MEASURE_MEASURING;
+            demo_measure_status = MEASURE_MEASURING;
             calib_state = CALIB_REF_MEASURING;
-            cem102->MeasureReference(cem102_dut, CEM102_REF_MEASUREMENT_CHAN);
+            p_cem102->MeasureReference(cem102_dut, CEM102_REF_MEASUREMENT_CHAN);
         }
     }
-
     else if (calib_state == CALIB_REF_MEASURING)
     {
-        APP_ReadMeasurement(cem102, RE);			// APP_REFERENCE_LENGTH 를 위해 RE를 읽는다..
+        APP_ReadMeasurement(p_cem102, RE);
     }
     else if (calib_state == CALIB_REF_READING)
     {
         /* Save the reference measurement */
-        calib_ref_measurement = measure_buf[APP_WE1_LOWER_HALF_WORD] +
-                               (measure_buf[APP_WE1_UPPER_HALF_WORD] << 16);
+        CEM102_GetValueFromBuffer(WE1, &calib_ref_measurement);
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("Start Calibration:WE1\r\n");
+#endif /* SWMTRACE_OUTPUT */
+        result = Config_ForMeasuring(WE1, target_mv);
 
-#if 1	// add for RE dac value...first calculation...very important
-        if (result == ERRNO_NO_ERROR)
-        {
-            result = DAC_GetCalibratedSetting(RE, dac_target_mV.ref, &dac_setting_re);		// sodykim
-            calib_data.dac_setting[RE - INDEX_ADJ_HELPER] = dac_setting_re;
-        }
-#endif
-
-
-#if 0
-        result |= Config_ForMeasuring(WE1, target_mv);
-#else
-        result |= Config_ForMeasuring(WE1, dac_target_mV.we1);	// sodykim
-#endif
         /* Now that we have our channel configuration, take a calibration
          * measurement
          */
-        cem102->CalibrateChannel(cem102_dut, WE1);
-        measure_status = MEASURE_MEASURING;
+        p_cem102->CalibrateChannel(cem102_dut, WE1);
+        demo_measure_status = MEASURE_MEASURING;
         calib_state = CALIB_CH1_MEASURING;
     }
     else if (calib_state == CALIB_CH1_MEASURING)
     {
-        APP_ReadMeasurement(cem102, WE1);
+        APP_ReadMeasurement(p_cem102, WE1);
     }
     else if (calib_state == CALIB_CH1_READING)
     {
-    	cal_measurement = measure_buf[APP_WE1_LOWER_HALF_WORD] +
-                         (measure_buf[APP_WE1_UPPER_HALF_WORD] << 16);
+        CEM102_GetValueFromBuffer(WE1, &cal_measurement);
 
-        cem102->CalculateChannelGain(cem102_dut, WE1, calib_ref_measurement, cal_measurement);
+        p_cem102->CalculateChannelGain(cem102_dut, WE1, calib_ref_measurement,
+                                     cal_measurement);
         calib_data.gain[WE1 - INDEX_ADJ_HELPER] = channel_gain[WE1 - INDEX_ADJ_HELPER];
 
-        result |= Config_PostMeasurement(WE1);
+        Config_PostMeasurement(WE1);
 
 #ifdef SWMTRACE_OUTPUT
         swmLogInfo("Start Calibration:WE2\r\n");
 #endif /* SWMTRACE_OUTPUT */
+        result = Config_ForMeasuring(WE2, target_mv);
 
-#if 0
-        result |= Config_ForMeasuring(WE2, target_mv);
-#else
-        result |= Config_ForMeasuring(WE2, dac_target_mV.we2);		// sodykim
-#endif
         /* Now that we have our channel configuration, take a calibration
          * measurement
          */
-        cem102->CalibrateChannel(cem102_dut, WE2);
-        measure_status = MEASURE_MEASURING;
+        p_cem102->CalibrateChannel(cem102_dut, WE2);
+        demo_measure_status = MEASURE_MEASURING;
         calib_state = CALIB_CH2_MEASURING;
     }
     else if (calib_state == CALIB_CH2_MEASURING)
     {
-        APP_ReadMeasurement(cem102, WE2);
+        APP_ReadMeasurement(p_cem102, WE2);
     }
     else if (calib_state == CALIB_CH2_READING)
     {
+        /* During calibration, only one channel is enabled. Measurement
+         * results from LSAD2 comes in first two words. Therefore the
+         * function CEM102_GetValueFromBuffer is passed WE1.
+         */
+        CEM102_GetValueFromBuffer(WE1, &cal_measurement);
 
-        cal_measurement = measure_buf[APP_WE2_LOWER_HALF_WORD] +
-                         (measure_buf[APP_WE2_UPPER_HALF_WORD] << 16);
-
-
-        cem102->CalculateChannelGain(cem102_dut, WE2, calib_ref_measurement,
+        p_cem102->CalculateChannelGain(cem102_dut, WE2, calib_ref_measurement,
                                      cal_measurement);
         calib_data.gain[WE2 - INDEX_ADJ_HELPER] = channel_gain[WE2 - INDEX_ADJ_HELPER];
 
-        result |= Config_PostMeasurement(WE2);
-
+        result = Config_PostMeasurement(WE2);
 #ifdef SWMTRACE_OUTPUT
         swmLogInfo("ChannelGain_2: 0x%X, 0x%X, 0x%X\r\n",
                    (int32_t)channel_gain[1], calib_ref_measurement,
                    cal_measurement);
 #endif /* SWMTRACE_OUTPUT */
 
-
         calib_data.vcc_trim = new_vcc_trim;
+
+        uint16_t dac_v[CEM102_MAX_DACS] =
+        {
+            WE1_DAC_V_USER_SETTING,
+            WE2_DAC_V_USER_SETTING,
+            RE_DAC_V_USER_SETTING,
+        };
 
         /* Calibration over. Save dac setting for 500 mv target voltage */
         int dac_error = ERRNO_NO_ERROR;
         CEM102_DAC_TYPE dac = WE1;
         uint8_t index = 0;
+        uint16_t regval = 0;
+
         for (dac = WE1; dac <= RE; dac++)
         {
             index = (uint8_t)dac - INDEX_ADJ_HELPER;
-#if 0
-        	dac_error |= DAC_GetCalibratedSetting(dac, APP_LEGACY_CALIB_DAC_VOLTAGE,  &dac_setting[index]);
-#else
-            if(dac==RE)
-            	dac_error |= DAC_GetCalibratedSetting(dac, dac_target_mV.ref,  &dac_setting[index]);
-            else if(dac==WE2)
-            	dac_error |= DAC_GetCalibratedSetting(dac, dac_target_mV.we2,  &dac_setting[index]);
-            else
-            	dac_error |= DAC_GetCalibratedSetting(dac, dac_target_mV.we1,  &dac_setting[index]);
-#endif
-
-            calib_data.dac_setting[index] = dac_setting[index];
-
-#ifdef SWMTRACE_OUTPUT
-        swmLogInfo("dac_setting: %d, %d\r\n",dac_setting[index], index);
-#endif /* SWMTRACE_OUTPUT */
+            dac_error = DAC_GetCalibratedSetting(dac,
+                                                 dac_v[index],
+                                                 &regval);
+            if (dac_error != ERRNO_NO_ERROR)
+            {
+                break;
+            }
+            calib_data.dac_setting[index] = regval;
+            calib_data.dac_v[index] = dac_v[index];
         }
 
-
-#if 0		// NONE SAVE CALIBRATION INFORMATION
         /* Save calibration data to the flash */
         if (dac_error == ERRNO_NO_ERROR)
         {
-            result |= cem102->CalibrationSave(&calib_data);
+            result = cem102->CalibrationSave(&calib_data);
+#ifdef SWMTRACE_OUTPUT
+            swmLogInfo("Calibration data saved in persistent memory\r\n");
+#endif /* SWMTRACE_OUTPUT */
         }
-#endif
 
         CEM102_SetCalibDone();
 
         uint16_t mask = 0;
-        uint16_t regval = 0;
+        regval = 0;
         if (dac_error == ERRNO_NO_ERROR)
         {
             /* When USE_LEGACY_WE_SET_CALIBRATION is set to 0, calibration
-             * sets the DAC to 1200 mV. Setting the DAC to user setting, which
-             * is 500 mV using the label WE_DAC_TARGET_MV */
-
-            uint8_t addr[3] = {
-                DC_DAC_WE1_CTRL,
-                DC_DAC_WE2_CTRL,
-                DC_DAC_RE_CTRL,
-            };
-
-            index = (uint8_t)RE - INDEX_ADJ_HELPER;
+             * sets the DAC to 1200 mV. Setting all the DACs to user setting.
+             */
             for (dac = WE1; dac <= RE; dac++)
             {
-                index = (uint8_t)dac - INDEX_ADJ_HELPER;
-#if 0
-                dac_error = DAC_GetCalibratedSetting(dac, WE_DAC_TARGET_MV, &regval);
-#else
-                if(dac==RE)
-                	dac_error |= DAC_GetCalibratedSetting(dac, dac_target_mV.ref,  &regval);
-                else if(dac==WE2)
-                	dac_error |= DAC_GetCalibratedSetting(dac, dac_target_mV.we2,  &regval);
-                else
-                	dac_error |= DAC_GetCalibratedSetting(dac, dac_target_mV.we1,  &regval);
-#endif
-                if (dac_error == ERRNO_NO_ERROR)
+                index = dac - INDEX_ADJ_HELPER;
+
+                uint16_t we_en = CEM102_GetDACEnableBit(cem102_dut, dac);
+
+                /* Value of the mask is same for all DACs */
+                mask = DC_DAC_WE1_CTRL_DAC_WE1_VALUE_MASK |
+                       DC_DAC_WE1_CTRL_DAC_WE1_CFG_MASK;
+                regval = calib_data.dac_setting[index] | we_en;
+
+                uint8_t dac_ctrl[CEM102_MAX_DACS] =
                 {
-                    /* Value of the mask is same for all DACs */
-                    mask = DC_DAC_WE1_CTRL_DAC_WE1_VALUE_MASK;
-                    cem102->RegisterReadModifyWrite(cem102_dut,
-                                                    addr[index], regval,
-                                                    mask);
-                }
+                    DC_DAC_WE1_CTRL,
+                    DC_DAC_WE2_CTRL,
+                    DC_DAC_RE_CTRL,
+                };
+                p_cem102->RegisterReadModifyWrite(cem102_dut,
+                                                dac_ctrl[index], regval,
+                                                mask);
             }
         }
 
         /* Calibration leaves these switches connected. Disconnecting
          * will improve the residual current measurements. */
         regval = ATBUS_SA14_DISCONNECT | ATBUS_SA7_DISCONNECT;
-        mask = ANA_SW_CFG2_ATBUS_SA14_CFG_MASK |  ANA_SW_CFG2_ATBUS_SA7_CFG_MASK;
-        result |= cem102->RegisterReadModifyWrite(cem102_dut, ANA_SW_CFG2,
-                                                  regval, mask);
+        mask = ANA_SW_CFG2_ATBUS_SA14_CFG_MASK |
+                        ANA_SW_CFG2_ATBUS_SA7_CFG_MASK;
+        p_cem102->RegisterReadModifyWrite(cem102_dut, ANA_SW_CFG2,
+                                          regval, mask);
+        mask = 1U << ANA_SW_CFG0_RE_SR1_CFG_POS;
+        regval = CEM102_SW_SR1_POSITION(p_dev);
+        p_cem102->RegisterReadModifyWrite(p_dev, ANA_SW_CFG0, regval, mask);
 
+        /* After calibration, RE BUF is disabled */
+        if (CEM102_RE_ENABLED(p_dev))
+        {
+            regval = RE_BUF_ENABLE;
+            mask = 1U << ANA_CFG1_RE_BUF_CFG_POS;
+            p_cem102->RegisterReadModifyWrite(p_dev, ANA_CFG1, regval, mask);
+        }
 #if APP_CEM102_FAST_CALIBRATION
         for (uint8_t idx = 0; idx < MAX_WE_CHANNEL_NUM; idx++)
         {
-            regval = APP_ORSD_USER_SETTING;
+            regval = cem102_dut->lsad_cfg_user[idx];
             mask = 0;
-            cem102->GetLSADConfig(cem102_dut, &regval, &mask);
+            p_cem102->GetLSADConfig(cem102_dut, &regval, &mask);
             uint8_t reg = CHCFG_CH1_LSAD + (idx * (CHCFG_CH2_THRESHOLD -
                                             CHCFG_CH1_THRESHOLD));
-            cem102->RegisterReadModifyWrite(cem102_dut, reg, regval, mask);
+            p_cem102->RegisterReadModifyWrite(cem102_dut, reg, regval, mask);
         }
 #endif /* APP_CEM102_FAST_CALIBRATION */
+        if (!APP_DiagMeasuresVoltage(cem102_dut))
+        {
+            APP_ConfigCurrentThresholdViolation(cem102_dut);
+        }
     }
     return result;
 }
 
-static bool CEM102_ReadFromQueue(DRIVER_CEM102_t *cem102,
+static bool CEM102_ReadFromQueue(DRIVER_CEM102_t *p_cem102,
                                  uint16_t cem102_status,
                                  uint16_t ch_completion_mask)
 {
@@ -1349,9 +1676,9 @@ static bool CEM102_ReadFromQueue(DRIVER_CEM102_t *cem102,
     if ((cem102_status & ch_completion_mask) == ch_completion_mask)
     {
         stat = true;
-        measure_status = MEASURE_READING_RESULTS;
-        int result = cem102->QueueRead(cem102_dut, SYS_BUFFER_WORD0,
-                                   MEASUREMENT_LENGTH);
+        demo_measure_status = MEASURE_READING_RESULTS;
+        int result = p_cem102->QueueRead(cem102_dut, SYS_BUFFER_WORD0,
+                                         MEASUREMENT_LENGTH);
         if (result != ERRNO_NO_ERROR)
         {
 #ifdef SWMTRACE_OUTPUT
@@ -1362,42 +1689,43 @@ static bool CEM102_ReadFromQueue(DRIVER_CEM102_t *cem102,
     return stat;
 }
 
-static bool CEM1020_ReadMeasurementData(DRIVER_CEM102_t *cem102,
+static bool CEM1020_ReadMeasurementData(DRIVER_CEM102_t *p_cem102,
                                         uint16_t cem102_status)
 {
     uint16_t ch_completion_mask = CH2_COMPLETION;
 
-#if APP_MEASURE_ACROSS_IO_INPUTS
     /* If measuring voltage, only check that channel 2 is done.
      * Otherwise, check that both channels are done.
      */
     if (APP_MeasuringCurrent())
-#endif /* APP_MEASURE_ACROSS_IO_INPUTS */
     {
+        if (!CEM102_WE2_ENABLED(cem102_dut))
+        {
+            ch_completion_mask &= ~CH2_COMPLETION;
+        }
         ch_completion_mask |= CH1_COMPLETION;
     }
-    return CEM102_ReadFromQueue(cem102, cem102_status, ch_completion_mask);
+    return CEM102_ReadFromQueue(p_cem102, cem102_status, ch_completion_mask);
 }
 
 #if APP_MEASURE_ACROSS_IO_INPUTS
-static void CEM102_CalculateVoltage(int32_t *p_we1_voltage,
+static void CEM102_CalculateVoltage(DRIVER_CEM102_t *p_cem102,
                                     int32_t *p_we2_voltage)
 {
-    /* Get WE1 Voltage and WE2 Voltage */
-    cem102->CalculateVoltage(WE1, (int32_t)(measure_buf[APP_WE1_LOWER_HALF_WORD] +
-                             (measure_buf[APP_WE1_UPPER_HALF_WORD] << 16)),
-                             p_we1_voltage);
-    cem102->CalculateVoltage(WE2, (int32_t)(measure_buf[APP_WE2_LOWER_HALF_WORD] +
-                             (measure_buf[APP_WE2_UPPER_HALF_WORD] << 16)),
-                             p_we2_voltage);
-#ifdef SWMTRACE_OUTPUT
-    char *voltage_type[] = { "Offset",
-                             "Fixed resistor",
-                             "VDDA",
-                           };
-    swmLogInfo("[%d]: %s WE2 voltage: %d\r\n",
-               voltage_id, voltage_type[voltage_id], (int32_t)*p_we2_voltage);
-#endif /* SWMTRACE_OUTPUT */
+    int32_t we2_result = 0;
+
+    /* During voltage measurement, one channel, LSAD2 is enabled.
+     * Results from the measurement comes in first two words. Therefore the
+     * function CEM102_GetValueFromBuffer is passed with WE1. CalculateVoltage
+     * HAL API uses ADC gain. It requires correct channel ID, which is WE2.
+     */
+    CEM102_GetValueFromBuffer(WE1, (uint32_t *)&we2_result);
+    if (we2_result < 0)
+    {
+        we2_result *= -1;
+    }
+    p_cem102->CalculateVoltage(CEM102_VOLTAGE_MEAS_CHAN, we2_result,
+                               p_we2_voltage);
 }
 
 static void CEM102_NextVoltageMeasurement(void)
@@ -1406,29 +1734,27 @@ static void CEM102_NextVoltageMeasurement(void)
      * next measurement */
     voltage_id++;
 
-    int status = APP_SetupATBusSwitch(voltage_id);
+    int status = APP_SetupATBusSwitch(cem102, cem102_dut, voltage_id);
     if (status != ERRNO_NO_ERROR)
     {
 #ifdef SWMTRACE_OUTPUT
         swmLogInfo("ERROR: Failed to switch IO measurement.\r\n");
 #endif /* SWMTRACE_OUTPUT */
     }
-    measure_status = MEASURE_MEASURING;
+    demo_measure_status = MEASURE_MEASURING;
     APP_SystemCommand(cem102);
 }
 
-static void CEM102_SwitchToVoltageMeasurement(DRIVER_CEM102_t *cem102)
+static void CEM102_SwitchToVoltageMeasurement(DRIVER_CEM102_t *p_cem102)
 {
     /* Reconfigure to measure voltage */
-    attribute_under_measure = APP_MEASURING_VOLTAGE;
-    voltage_id = APP_MEASURE_OFFSET_VOLTAGE;
+    APP_SetMeasureAttribute(APP_MEASURING_VOLTAGE);
+    voltage_id = APP_MEASURE_VOLTAGE_TYPE_FIRST;
 
-    int status = Config_SendIdleCommand();
-    status |= APP_SetupATBusSwitch(voltage_id);
+    int status = APP_SetupATBusSwitch(p_cem102, cem102_dut, voltage_id);
 
     CEM102_SetThreshViolDetection(false, false);
-    measure_status = MEASURE_MEASURING;
-    APP_SystemCommand(cem102);
+    demo_measure_status = MEASURE_MEASURING;
 
     if (status != ERRNO_NO_ERROR)
     {
@@ -1436,144 +1762,121 @@ static void CEM102_SwitchToVoltageMeasurement(DRIVER_CEM102_t *cem102)
         swmLogInfo("ERROR: Failed to start IO measurements.\r\n");
 #endif /* SWMTRACE_OUTPUT */
     }
-}
-
-/* Called when all three voltage measurements are done */
-static void CEM102_SwitchToCurrMeasurement(DRIVER_CEM102_t *cem102)
-{
-    APP_CalculateTemperature();
-
-    /* Reset the voltage ID and the age of the measurement */
-    voltage_id = APP_MEASURE_OFFSET_VOLTAGE;
-    voltage_measurement_age = 1;
-
-    /* Reconfigure to measure current */
-    attribute_under_measure = APP_MEASURING_CURRENT;
-    int status = Config_SendIdleCommand();
-
-    /* Reset the AT Bus switches to their disconnected state. */
-    status |= cem102->RE_ATBusSwitchConfig(cem102_dut, RE, 0U);
-    status |= cem102->AIOConfigDeinit(cem102_dut, WE2, &saved_regs);
-
-    CEM102_SetThreshViolDetection(true, true);
-    measure_status = MEASURE_MEASURING;
-    APP_SystemCommand(cem102);
-    if (status != ERRNO_NO_ERROR)
-    {
-#ifdef SWMTRACE_OUTPUT
-        swmLogInfo("ERROR: Failed to start WE measurements.\r\n");
-#endif /* SWMTRACE_OUTPUT */
-    }
+    APP_SystemCommand(p_cem102);
 }
 #endif /* APP_MEASURE_ACROSS_IO_INPUTS */
 
-static void CEM102_CalculateCurrent(bool display, float *p_we1_current,
-                                    float *p_we2_current)
+/* Called when all three voltage measurements are done */
+static void CEM102_SwitchToCurrMeasurement(DRIVER_CEM102_t *p_cem102,
+                                           const CEM102_Device *p_dev)
 {
-    /* Get WE1 Current and WE2 Current */
-    cem102->CalculateCurrent(WE1, (int32_t)(measure_buf[APP_WE1_LOWER_HALF_WORD] +
-                             (measure_buf[APP_WE1_UPPER_HALF_WORD] << 16)),
-                             p_we1_current);
+#if APP_MEASURE_ACROSS_IO_INPUTS || CEM102_DIAG_FUNCTIONS
+    /* Reconfigure to measure current */
+    APP_SetMeasureAttribute(APP_MEASURING_CURRENT);
+    Config_SendIdleCommand();
 
-    cem102->CalculateCurrent(WE2, (int32_t)(measure_buf[APP_WE2_LOWER_HALF_WORD] +
-                             (measure_buf[APP_WE2_UPPER_HALF_WORD] << 16)),
-                             p_we2_current);
+    uint16_t reg = p_dev->lsad_prescale_curr;
+    uint16_t mask =  CHCFG_LSAD_CLK_LSAD_CLK_PRESCALE_MASK;
+    p_cem102->RegisterReadModifyWrite(p_dev, CHCFG_LSAD_CLK, reg, mask);
 
-    if (display)
+#if APP_MEASURE_ACROSS_IO_INPUTS
+
+    /* Reset the voltage ID and the age of the measurement */
+    voltage_id = APP_MEASURE_VOLTAGE_TYPE_FIRST;
+
+    /* Reset the AT Bus switches to their disconnected state. */
+    p_cem102->AIOConfigDeinit(p_dev, CEM102_VOLTAGE_MEAS_CHAN,
+                              &saved_regs);
+
+    demo_measure_status = MEASURE_MEASURING;
+#else /* APP_MEASURE_ACROSS_IO_INPUTS */
+
+    /* Diagnostics may have disabled LSAD. */
+    CEM102_ChannelCtrl(p_cem102, WE2, true);
+#endif /* APP_MEASURE_ACROSS_IO_INPUTS */
+    if (APP_MeasuringCurrent())
     {
-#ifdef SWMTRACE_OUTPUT
-        swmLogInfo("Measured current (nA): %.6f, %.6f, cem102_vbat: %d millivolts\r\n",
-                   *p_we1_current / APP_FEMTO_NANO_COV_FACTOR,
-                   *p_we2_current / APP_FEMTO_NANO_COV_FACTOR, cem102_vbat);
-#endif /* SWMTRACE_OUTPUT */
+        APP_ConfigCurrentThresholdViolation(p_dev);
     }
+
+    CEM102_ChannelCtrl(p_cem102, WE1, true);
+    APP_SystemCommand(p_cem102);
+#endif /* APP_MEASURE_ACROSS_IO_INPUTS || CEM102_DIAG_FUNCTIONS */
+}
+
+static void CEM102_CalculateCurrent(float *p_we1_current, float *p_we2_current)
+{
+    CEM102_DAC_TYPE dacs[MAX_WE_CHANNEL_NUM] = { WE1, WE2 };
+    int32_t we_result[MAX_WE_CHANNEL_NUM] = { 0 };
+    float curr[MAX_WE_CHANNEL_NUM] = { 0 };
+    uint8_t count = (CEM102_WE1_WE2_ENABLED(cem102_dut)) ?
+                     MAX_WE_CHANNEL_NUM : 1;
+
+    for (uint8_t i = 0; i < count; i++)
+    {
+        CEM102_GetValueFromBuffer(dacs[i], (uint32_t *)&we_result[i]);
+        cem102->CalculateCurrent(dacs[i], we_result[i], &curr[i]);
+    }
+    *p_we1_current = curr[CEM102_WE1_INDEX];
+    *p_we2_current = curr[CEM102_WE2_INDEX];
 }
 
 static void CEM102_UpdateCurrentAndVBAT(void)
 {
-	float WE1_cur = 0;
-	float WE2_cur = 0;
+    float WE1_cur = 0;
+    float WE2_cur = 0;
 
-	CEM102_CalculateCurrent(false, &WE1_cur, &WE2_cur);
+    CEM102_CalculateCurrent(&WE1_cur, &WE2_cur);
 
-#if 0
-	/* Convert float type of current values to IEEE11073 format integer */
-	WE1_current = App_Utils_ConvertFloatToUInt32(WE1_cur);
-	WE2_current = App_Utils_ConvertFloatToUInt32(WE2_cur);
-#endif
-
-	/* Calculate CEM102 VBAT using SAR ADC */
-	cem102->CalculateVBAT(&cem102_vbat);
-
-/********************************************************************************************************************************************************************
- * 		CHANGE UXN PROTOCOL FORMAT...(nA -> WEO & WEP)	(fA)FEMTO -> (nA)NANO
- ********************************************************************************************************************************************************************/
-	afe_102->we1_current = WE1_cur/APP_FEMTO_NANO_COV_FACTOR;
-	afe_102->we2_current = WE2_cur/APP_FEMTO_NANO_COV_FACTOR;
-	afe_102->vbat_lvl_mV = cem102_vbat;
-
-	rsl15_info->vbat_lvl_mV = afe_102->vbat_lvl_mV;
-
-#if 1
-	if(afe_102->we1_current >= MAX_WEO_LVL_MV)	afe_102->we1_current = MAX_WEO_LVL_MV;
-	if(afe_102->we1_current <= MIN_WEO_LVL_MV)	afe_102->we1_current = MIN_WEO_LVL_MV;
-	if(afe_102->we2_current >= MAX_WEO_LVL_MV)	afe_102->we2_current = MAX_WEO_LVL_MV;
-	if(afe_102->we2_current <= MIN_WEO_LVL_MV)	afe_102->we2_current = MIN_WEO_LVL_MV;
-#endif
-
-	if((afe_102->we1_current == 0) && (afe_102->we2_current == 0)) {	// afe_102->we1_current = 0 afe_102->we2_current = 0 는 AFE 오류..이젠 값을 가져 온다.
-		if((we1_current!=1000.0f)&&(we2_current!=1000.0f)) {
-			afe_102->we1_current = we1_current;
-			afe_102->we2_current = we2_current;
-		}
-	}
-	else {
-		we1_current = afe_102->we1_current;
-		we2_current = afe_102->we2_current;
-	}
-
-	LSAD_measure_sensor_level();												// read to battery & temperature...rtc time sync
-
-#ifdef SWMTRACE_OUTPUT
-	swmLogInfo("WEO1 : ("LOG_FLOAT_MARKER")nA, WEO2 ("LOG_FLOAT_MARKER")nA, VBat : %d , Temp : [%d]\r\n",
-			LOG_FLOAT(afe_102->we1_current),  LOG_FLOAT(afe_102->we2_current), afe_102->vbat_lvl_mV, rsl15_info->temperature
-			);
-#endif
-
+    APP_NotifyCurrentData(cem102, cem102_dut, WE1_cur, WE2_cur);
 }
 
-static void CEM102_ProcessMeasurementData(DRIVER_CEM102_t *cem102)
+static void CEM102_ProcessMeasurementData(DRIVER_CEM102_t *p_cem102)
 {
+    const CEM102_Device *p_dev = cem102_dut;
+
 #if APP_MEASURE_ACROSS_IO_INPUTS
     if (APP_MeasuringVoltage())
     {
-        CEM102_CalculateVoltage(&WE1_voltage, &WE2_voltage);
+        CEM102_CalculateVoltage(p_cem102, &measure_values[voltage_id]);
     }
     else
 #endif /* APP_MEASURE_ACROSS_IO_INPUTS */
+    if (APP_MeasuringCurrent())
     {
+        /* What to do after current set of measurements are done */
+        CEM102_ControlNextIteration(p_cem102, p_dev);
+
         CEM102_UpdateCurrentAndVBAT();
+
+        /* With current measurement, which is last in the sequence, done,
+         * current set of measurements is over. Measurement timer will
+         * kickstart the next set of measurements.
+         */
+        demo_measure_status = MEASURE_IDLE;
     }
 
-#ifdef SWMTRACE_OUTPUT
-    if (ch1_violation_count + ch2_violation_count)
+    /* About to recognize the threshold violation event. Clear it */
+    if (APP_CEM102EventValid(APP_EVENT_THRESH_VIOLATION))
     {
-        swmLogInfo("Threshold violation count CH1 = %d, CH2 = %d\r\n",
-                   ch1_violation_count, ch2_violation_count);
+        APP_ClearCEM102Event(APP_EVENT_THRESH_VIOLATION);
     }
-#endif /* SWMTRACE_OUTPUT */
+
+    APP_NotifyThresholdViolation(p_cem102, p_dev,
+                                 ch1_violation_count,
+                                 ch2_violation_count);
     ch1_violation_count = 0;
     ch2_violation_count = 0;
 }
 
-static void CEM102_PrepNextMeasurement(DRIVER_CEM102_t *cem102)
+static void CEM102_PrepNextMeasurement(DRIVER_CEM102_t *p_cem102)
 {
 #if (CEM102_VDDA_ERR_OPERATION == VDDA_ERR_RECOVERY_MODE)
     /* If VDDA_ERR happened, clear the flag and re-enable VDDA_ERR IRQ */
     if (irq_valid_flag)
     {
         irq_valid_flag = 0;
-        cem102->IRQConfig(cem102_dut, irq_cfg);
+        p_cem102->IRQConfig(cem102_dut, irq_cfg);
     }
 #endif /* (CEM102_VDDA_ERR_OPERATION == VDDA_ERR_RECOVERY_MODE) */
 
@@ -1582,19 +1885,21 @@ static void CEM102_PrepNextMeasurement(DRIVER_CEM102_t *cem102)
         SENSOR->THRESHOLD_MIN |= SENSOR_THRESHOLD_MIN_ENABLED;
     }
 
-    measure_status = MEASURE_MEASURING;
-
 #if APP_MEASURE_ACROSS_IO_INPUTS
+    demo_measure_status = MEASURE_MEASURING;
+
     /* Update the measurement configuration */
     if (APP_MeasuringVoltage())
     {
-        measure_values[voltage_id] = WE2_voltage;
-
-        /* If the last voltage has been measured, calculate the
-        * temperature and switch to measuring current. */
-        if (voltage_id == APP_MEASURE_VDDA_VOLTAGE)
+        /* If the last voltage for thermistor application has been measured,
+         * calculate the temperature and switch to next measurement. */
+        if (voltage_id == APP_MEASURE_VOLTAGE_TYPE_LAST)
         {
-            CEM102_SwitchToCurrMeasurement(cem102);
+            APP_CalculateTemperature(p_cem102, cem102_dut);
+            if (!APP_StartMeasurementWithDiag(p_cem102, cem102_dut))
+            {
+                CEM102_SwitchToCurrMeasurement(p_cem102, cem102_dut);
+            }
         }
         else
         {
@@ -1603,43 +1908,31 @@ static void CEM102_PrepNextMeasurement(DRIVER_CEM102_t *cem102)
     }
     else
     {
-        /* If the voltage measurement is too old (i.e. has expired),
-        * switch to measuring voltage.
-        * Otherwise, continue with current measurements.
-        */
-        if (voltage_measurement_age == APP_VOLTAGE_MEASUREMENT_EXPIRY)
-        {
-            CEM102_SwitchToVoltageMeasurement(cem102);
-        }
-        else
-        {
-            APP_SystemCommand(cem102);
-            voltage_measurement_age++;
-
-            /* Reenable, if it is disabled by the handler before */
-            if (APP_CEM102EventValid(APP_EVENT_THRESH_VIOLATION))
-            {
-                APP_ClearCEM102Event(APP_EVENT_THRESH_VIOLATION);
-                CEM102_SetThreshViolDetection(true, true);
-            }
-        }
+        CEM102_SwitchToVoltageMeasurement(p_cem102);
     }
-#else
-    if (APP_CEM102EventValid(APP_EVENT_THRESH_VIOLATION))
+#else /* APP_MEASURE_ACROSS_IO_INPUTS */
+    if (demo_measure_status == MEASURE_IDLE)
     {
-        APP_ClearCEM102Event(APP_EVENT_THRESH_VIOLATION);
-        CEM102_SetThreshViolDetection(true, true);
+        demo_measure_status = MEASURE_MEASURING;
+
+        /* If there is no measurement done inside diag module,
+         * kick start the measurement here.
+         */
+        if (!APP_StartMeasurementWithDiag(p_cem102, cem102_dut))
+        {
+            APP_ConfigCurrentThresholdViolation(cem102_dut);
+            APP_SystemCommand(p_cem102);
+        }
     }
-    APP_SystemCommand(cem102);
 #endif /* APP_MEASURE_ACROSS_IO_INPUTS */
 }
 
-static void CEM102_ChanViolationHandler(DRIVER_CEM102_t *cem102)
+static void CEM102_ChanViolationHandler(DRIVER_CEM102_t *p_cem102)
 {
     uint16_t v_count = 0;
 
     /* Read the violation count */
-    cem102->RegisterRead(cem102_dut, SYS_BUFFER_VIOL_CNT, &v_count);
+    p_cem102->RegisterRead(cem102_dut, SYS_BUFFER_VIOL_CNT, &v_count);
 
     /* If violation persists, interrupt will persisist too. MCU will
      * be busy servicing the interrupt. Disable threshold detection for
@@ -1647,21 +1940,74 @@ static void CEM102_ChanViolationHandler(DRIVER_CEM102_t *cem102)
     CEM102_SetThreshViolDetection(false, false);
 
     /* Clear the violation and restart the measurement */
-    measure_status = MEASURE_MEASURING;
-    APP_SystemCommand(cem102);
+    demo_measure_status = MEASURE_MEASURING;
+    APP_SystemCommand(p_cem102);
 
     ch1_violation_count += (v_count &
-                           SYS_BUFFER_VIOL_CNT_CH1_VIOLATION_CNT_MASK) >>
-                           SYS_BUFFER_VIOL_CNT_CH1_VIOLATION_CNT_POS;
+                            SYS_BUFFER_VIOL_CNT_CH1_VIOLATION_CNT_MASK) >>
+                            SYS_BUFFER_VIOL_CNT_CH1_VIOLATION_CNT_POS;
     ch2_violation_count += (v_count &
-                           SYS_BUFFER_VIOL_CNT_CH2_VIOLATION_CNT_MASK) >>
-                           SYS_BUFFER_VIOL_CNT_CH2_VIOLATION_CNT_POS;
+                            SYS_BUFFER_VIOL_CNT_CH2_VIOLATION_CNT_MASK) >>
+                            SYS_BUFFER_VIOL_CNT_CH2_VIOLATION_CNT_POS;
     APP_SetCEM102Event(APP_EVENT_THRESH_VIOLATION);
 }
 
-void CEM102_Operation(DRIVER_CEM102_t *cem102)
+/* Will run if meas_timer_interval is initialized with non-zero value */
+void CEM102_MeasurementTimerHandler(void)
+{
+    /* Timer event received. Time to start next set of measurements */
+    if (demo_measure_status == MEASURE_IDLE)
+    {
+        CEM102_SetupMeasurementCycle(cem102, cem102_dut);
+        CEM102_PrepNextMeasurement(cem102);
+    }
+    APP_StartTheMeasurementTimer(cem102_dut);
+}
+
+static void APP_HandleDiagAPI(DRIVER_CEM102_t *p_cem102,
+                              const CEM102_Device *p_dev)
+{
+    if (APP_CEM102EventValid(APP_EVENT_FROM_CEM102))
+    {
+        APP_ClearCEM102Event(APP_EVENT_FROM_CEM102);
+        CEM102_DiagnosticsAPI(p_cem102, p_dev);
+    }
+    if (CEM102_DiagnosticsAPIDone(p_cem102, p_dev))
+    {
+        CEM102_SwitchToCurrMeasurement(p_cem102, p_dev);
+    }
+}
+
+/* When all the timer related events are received, timer will be started,
+ * if not running already.
+ */
+void APP_SetMeasureTimerEvent(const CEM102_Device *p_dev, uint8_t ev)
+{
+    ev &= MEAS_TIMER_OK_TO_RUN_MASK;
+    meas_timer_ok_to_run |= ev;
+
+    /* Some events are not needed on certain conditions */
+    if (!APP_DiagMeasuresVoltage(p_dev))
+    {
+        meas_timer_ok_to_run |= MEAS_TIMER_OK_TO_RUN_DIAGAPI;
+    }
+#if !CEM102_DIAG_FUNCTIONS
+    meas_timer_ok_to_run |= MEAS_TIMER_OK_TO_RUN_DIAGAPI;
+    meas_timer_ok_to_run |= MEAS_TIMER_OK_TO_RUN_DIAGNOSTICS;
+#endif
+    uint8_t flag = (meas_timer_ok_to_run & MEAS_TIMER_OK_TO_RUN_MASK);
+    if ((flag == MEAS_TIMER_OK_TO_RUN_MASK) &&
+        ((meas_timer_ok_to_run & MEAS_TIMER_STARTED_RUNNING) == 0))
+    {
+        meas_timer_ok_to_run |= MEAS_TIMER_STARTED_RUNNING;
+        APP_StartTheMeasurementTimer(p_dev);
+    }
+}
+
+void CEM102_Operation(DRIVER_CEM102_t *p_cem102)
 {
     static uint16_t saved_sys_status = 0;
+    const CEM102_Device *p_dev = cem102_dut;
 
     if (cem102_low_vbat)
     {
@@ -1676,12 +2022,12 @@ void CEM102_Operation(DRIVER_CEM102_t *cem102)
 
         /* Read the chip family information. This is for debug purpose only to
          * see if cem102 is responsive. */
-        int result = cem102->RegisterRead(cem102_dut, CHIP_FAMILY_VERSION,
-                                          &fam);
+        int result = p_cem102->RegisterRead(cem102_dut, CHIP_FAMILY_VERSION,
+                                            &fam);
         if (ERRNO_NO_ERROR != result)
         {
 #ifdef SWMTRACE_OUTPUT
-            swmLogInfo("\r\Error while reading chip version\r\n");
+            swmLogInfo("\rError while reading chip version\r\n");
 #endif /* SWMTRACE_OUTPUT */
         }
         else if (0 == fam)
@@ -1692,7 +2038,6 @@ void CEM102_Operation(DRIVER_CEM102_t *cem102)
         }
 
 #ifdef SWMTRACE_OUTPUT
-        swmLogInfo("- CHIP_FAMILY_VERSION: %X.\r\n", fam);
         swmLogInfo("Restaring CEM102...\r\n");
 #endif /* SWMTRACE_OUTPUT */
         wakeup_irq = 0;
@@ -1703,74 +2048,112 @@ void CEM102_Operation(DRIVER_CEM102_t *cem102)
          */
         Sys_Sensor_Disable();
 
-        measure_status = MEASURE_IDLE;
+        demo_measure_status = MEASURE_IDLE;
         calib_state = CALIB_NOT_STARTED;
 
-        /* Put 100 ms Delay before restarting to allow the system to settle */
-        Sys_Delay(APP_SYS_DELAY_100MS);
-        CEM102_Restart(cem102, true);
+        /* Delay before restarting to allow the system to settle */
+        CEM102_RestartWithDelay(p_cem102, true);
     }
 
 
     /* If the system has just completed initialization, start the first
      * measurement, after running the diagnostics, if enabled.
      */
-    if (measure_status == MEASURE_INITIALIZED &&
-        CEM102_DiagnosticsDone(cem102))
+    if (demo_measure_status == MEASURE_INITIALIZED &&
+        (calib_state == CALIB_DONE) &&
+        CEM102_DiagnosticsDone(p_cem102))
     {
         wakeup_irq = 0;
 
         int status = ERRNO_NO_ERROR;
+
+        /* We are ready for measurement. Let the HAL layer know */
+        p_cem102->NotifyEvent(p_dev, true, CEM102_APP_EV_MEASURE_PHASE, NULL);
+
+        if (!CEM102_WE2_ENABLED(p_dev))
+        {
+            p_cem102->SwitchConfig(p_dev, WE2, 0);
+        }
+        for (uint8_t idx = 0; idx < CEM102_NUM_LSADS; idx++)
+        {
+            /* Initialize LSAD/BUFFER for current configuration, before
+             * switching to voltage configuration */
+            APP_UpdateChannelConfig(p_cem102, p_dev, idx, false, false);
+        }
 #if APP_MEASURE_ACROSS_IO_INPUTS
         /* Set the starting attribute to measure to be the voltage via IO */
-        attribute_under_measure = APP_MEASURING_VOLTAGE;
+        APP_SetMeasureAttribute(APP_MEASURING_VOLTAGE);
 
         /* Initialize the switches and ADC for the measurement.
          *
          * AIOConfigInit API uses CEM102_ACCUM_SAMPLE_CNT_2. ADC gain is
          * Calculated inside the AIOConfigInit
          *
-         * For IO measurements, WE2 channel is used.
+         * For IO measurements, CEM102_VOLTAGE_MEAS_CHAN (WE2) channel is used.
          */
-        cem102->AIOConfigInit(cem102_dut, WE2, &saved_regs);
+        p_cem102->AIOConfigInit(cem102_dut, CEM102_VOLTAGE_MEAS_CHAN,
+                                &saved_regs);
 
         /* Setup the Test bus' switches correctly for the first measurement */
-        voltage_id = APP_MEASURE_OFFSET_VOLTAGE;
-        APP_SetupATBusSwitch(voltage_id);
-#endif /* APP_MEASURE_ACROSS_IO_INPUTS */
+        voltage_id = APP_MEASURE_VOLTAGE_TYPE_FIRST;
+        APP_SetupATBusSwitch(p_cem102, cem102_dut, voltage_id);
+#endif
+        if (!CEM102_WE2_ENABLED(cem102_dut))
+        {
+            /* Mask value is same for all DACS */
+            p_cem102->RegisterReadModifyWrite(p_dev,
+                                              DC_DAC_WE2_CTRL,
+                                              DAC_WE2_DISABLE,
+                                              DC_DAC_WE1_CTRL_DAC_WE1_CFG_MASK);
 
+            /* Voltage measurements require LSAD2. Current measurement
+             * can have LSAD2 enabled, if configuration allows
+             */
+            APP_UpdateChannelConfig(cem102, p_dev, CEM102_LSAD2_IDX,
+                                    APP_CurrentOnlyMeasurement(p_dev) ?
+                                    false : true,
+                                    APP_CurrentOnlyMeasurement(p_dev) ?
+                                    false : true);
+            if (APP_CurrentOnlyMeasurement(cem102_dut))
+            {
+                CEM102_ConfigureLSAD(p_cem102, p_dev, WE2, false);
+            }
+        }
+        if (!CEM102_RE_ENABLED(cem102_dut))
+        {
+            p_cem102->RegisterReadModifyWrite(p_dev,
+                                              DC_DAC_RE_CTRL,
+                                              DAC_RE_DISABLE,
+                                              DC_DAC_RE_CTRL_DAC_RE_CFG_MASK);
+        }
+#if !APP_MEASURE_ACROSS_IO_INPUTS
+        /* After calibration, LSAD2 is enabled, while LSAD1 is disabled */
+        if (!APP_StartMeasurementWithDiag(p_cem102, p_dev))
+        {
+            /* By default, it is set to measure voltage */
+            APP_SetMeasureAttribute(APP_MEASURING_CURRENT);
+
+            /* At this stage, LSAD2 is enabled, LSAD1 may be disabled
+             * due to diagnostics.
+             */
+            CEM102_ChannelCtrl(p_cem102, WE1, true);
+        }
+#endif /* NOT APP_MEASURE_ACROSS_IO_INPUTS */
         if (status == ERRNO_NO_ERROR)
         {
-            swmLogInfo("measure_status : MEASURE_INITIALIZED.\r\n");
+            demo_measure_status = MEASURE_MEASURING;
 
-            measure_status = MEASURE_MEASURING;
-
-            /* In the right state to handle the interrupts. Enabling them. */
-            uint16_t mask = SYSCTRL_IRQ_CFG_VDDA_ERR_IRQ_CFG_MASK |
-                            SYSCTRL_IRQ_CFG_STATE_ERR_IRQ_CFG_MASK |
-                            SYSCTRL_IRQ_CFG_DIGITAL_RESET_IRQ_CFG_MASK;
-            uint16_t data = VDDA_ERR_IRQ_ENABLE | STATE_ERR_IRQ_ENABLE |
-                            DIGITAL_RESET_IRQ_ENABLE;
-
-            /* Enable the threshold violation detection, if enabled */
-            if (CEM102_ThreshViolationEnabled())		//         if ((CEM102_THRESH_VIOL_ENABLED == cem102_threshold_violation) && (calib_state == CALIB_DONE))
+            APP_SetMeasureTimerEvent(cem102_dut, MEAS_TIMER_OK_TO_RUN_INIT);
+            if (calib_ref_measurement != 0)
             {
-                if (APP_MeasuringCurrent())
-                {
-                    CEM102_SetThreshViolDetection(true, true);
-                }
-
-                mask |= (SYSCTRL_IRQ_CFG_CH1_VIOLATION_IRQ_CFG_MASK |
-                         SYSCTRL_IRQ_CFG_CH2_VIOLATION_IRQ_CFG_MASK);
-                data |= (CH1_VIOLATION_IRQ_ENABLE | CH2_VIOLATION_IRQ_ENABLE);
+                APP_SetMeasureTimerEvent(cem102_dut, MEAS_TIMER_OK_TO_RUN_DIAGAPI);
             }
-
-            /* Ready to proess interrupts. Time to enable them. */
-            cem102->RegisterReadModifyWrite(cem102_dut, SYSCTRL_IRQ_CFG, data, mask);
-            APP_SystemCommand(cem102);
-
-            cem102->RegisterRead(cem102_dut, SYS_STATUS, &saved_sys_status);
-
+            if (!APP_MeasuringWithDiag())
+            {
+                APP_SystemCommand(p_cem102);
+            }
+            p_cem102->RegisterRead(cem102_dut, SYS_STATUS,
+                                 &saved_sys_status);
         }
 #ifdef SWMTRACE_OUTPUT
         else
@@ -1779,7 +2162,7 @@ void CEM102_Operation(DRIVER_CEM102_t *cem102)
         }
 #endif /* SWMTRACE_OUTPUT */
     }
-    else
+    else if (calib_state == CALIB_DONE)
     {
         int result = ERRNO_NO_ERROR;
 
@@ -1788,9 +2171,8 @@ void CEM102_Operation(DRIVER_CEM102_t *cem102)
         {
             uint16_t cem102_status = 0;
             wakeup_irq = 0;
-
             APP_SetCEM102Event(APP_EVENT_FROM_CEM102);
-            result = cem102->RegisterRead(cem102_dut, SYS_STATUS,
+            result = p_cem102->RegisterRead(cem102_dut, SYS_STATUS,
                                           &cem102_status);
             if (ERRNO_NO_ERROR == result)
             {
@@ -1808,12 +2190,12 @@ void CEM102_Operation(DRIVER_CEM102_t *cem102)
             saved_sys_status = 0;
 
             /* Save current IRQ configuration */
-            result = cem102->RegisterRead(cem102_dut, SYSCTRL_IRQ_CFG,
+            result = p_cem102->RegisterRead(cem102_dut, SYSCTRL_IRQ_CFG,
                                           &irq_cfg);
             if (result == ERRNO_NO_ERROR)
             {
                 /* Disable Digital Reset IRQ */
-                result = cem102->IRQConfig(cem102_dut, irq_cfg &
+                result = p_cem102->IRQConfig(cem102_dut, irq_cfg &
                                            (~DIGITAL_RESET_IRQ_ENABLE));
             }
 
@@ -1827,39 +2209,44 @@ void CEM102_Operation(DRIVER_CEM102_t *cem102)
              */
             Sys_Sensor_Disable();
 
-            measure_status = MEASURE_IDLE;
+            demo_measure_status = MEASURE_IDLE;
             calib_state = CALIB_NOT_STARTED;
 
-            /* 50 ms delay before restarting to allow the system to settle */
-            Sys_Delay(APP_SYS_DELAY_50MS);
-            CEM102_Restart(cem102, true);
+            /* Delay before restarting to allow the system to settle */
+            CEM102_RestartWithDelay(p_cem102, true);
         }
-
         else if ((saved_sys_status & STATE_ERR) == STATE_ERR)
         {
 #ifdef SWMTRACE_OUTPUT
             swmLogInfo("ERROR: State Error. Restarting CEM102...\r\n");
 #endif /* SWMTRACE_OUTPUT */
             saved_sys_status = 0;
-            measure_status = MEASURE_IDLE;
+            demo_measure_status = MEASURE_IDLE;
             calib_state = CALIB_NOT_STARTED;
 
             /* State Error occurred, re-initialize the CEM102. */
-            CEM102_Startup(cem102);
+            CEM102_Restart(p_cem102, true);
         }
         else if ((saved_sys_status & VDDA_ERR) == VDDA_ERR)
         {
             saved_sys_status &= ~VDDA_ERR;
-            VDDA_ERR_Handler();
+
+            /* To avoid handler run again before previous call completes */
+            if (!vdda_err_handled)
+            {
+                vdda_err_handled = true;
+                VDDA_ERR_Handler();
+                vdda_err_handled = false;
+            }
 
             /* If VDDA_ERR_Handler returns, that means RECOVERY is defined */
-            cem102->RegisterRead(cem102_dut, SYS_STATUS,
+            p_cem102->RegisterRead(cem102_dut, SYS_STATUS,
                                  &saved_sys_status);
         }
         else if (saved_sys_status & (CH1_VIOLATION|CH2_VIOLATION))
         {
-            CEM102_ChanViolationHandler(cem102);
-            cem102->RegisterRead(cem102_dut, SYS_STATUS,
+            CEM102_ChanViolationHandler(p_cem102);
+            p_cem102->RegisterRead(cem102_dut, SYS_STATUS,
                                  &saved_sys_status);
         }
         else
@@ -1878,25 +2265,29 @@ void CEM102_Operation(DRIVER_CEM102_t *cem102)
 #endif /* CEM102_DIAG_FUNCTIONS */
             }
 
-            if (!CEM102_DiagnosticsDone(cem102))
+            if (!CEM102_DiagnosticsDone(p_cem102))
             {
                 if (APP_CEM102EventValid(APP_EVENT_FROM_CEM102))
                 {
                     APP_ClearCEM102Event(APP_EVENT_FROM_CEM102);
-                    CEM102_Diagnostics(cem102);
+                    CEM102_Diagnostics(p_cem102);
                 }
+            }
+            else if (APP_MeasuringWithDiag())
+            {
+                APP_HandleDiagAPI(p_cem102, cem102_dut);
             }
             else
             {
                 /* Check if the next results can be read */
-                if ((measure_status != MEASURE_READING_RESULTS) &&
-                    (measure_status != MEASURE_RESULTS_READY))
+                if ((demo_measure_status != MEASURE_READING_RESULTS) &&
+                    (demo_measure_status != MEASURE_RESULTS_READY))
                 {
                     if ((CEM102_ValidStateToMeasure(saved_sys_status)) &&
                         (APP_CEM102EventValid(APP_EVENT_FROM_CEM102)))
                     {
                         APP_ClearCEM102Event(APP_EVENT_FROM_CEM102);
-                        if (CEM1020_ReadMeasurementData(cem102,
+                        if (CEM1020_ReadMeasurementData(p_cem102,
                                                         saved_sys_status))
                         {
                             saved_sys_status &= ~(CH1_COMPLETION |
@@ -1911,7 +2302,7 @@ void CEM102_Operation(DRIVER_CEM102_t *cem102)
                  * Measure_status changes on DMA irq. cem102_status gets
                  * updated on wakeup_irq. Both variables may not have valid
                  * values at the same time. On such cases, being a local
-                 * variable, cem102_status may be 0, when measure_status is
+                 * variable, cem102_status may be 0, when demo_measure_status is
                  * set to MEASURE_RESULTS_READY. It is better to use the
                  * SYS STATE value that is saved during the previous
                  * interrupt.
@@ -1920,13 +2311,17 @@ void CEM102_Operation(DRIVER_CEM102_t *cem102)
                                         SYS_STATUS_SYS_STATE_MASK;
                 if (((cem102_state == CONTINUOUS_STATE) ||
                     (cem102_state == IDLE_STATE)) &&
-                    (measure_status == MEASURE_RESULTS_READY))
+                    (demo_measure_status == MEASURE_RESULTS_READY))
                 {
                     SYS_WATCHDOG_REFRESH();
 
-                    CEM102_ProcessMeasurementData(cem102);
-
-                    CEM102_PrepNextMeasurement(cem102);
+                    CEM102_ProcessMeasurementData(p_cem102);
+                    if ((next_measurement_iteration) ||
+                        (demo_measure_status != MEASURE_IDLE))
+                    {
+                        next_measurement_iteration = false;
+                        CEM102_PrepNextMeasurement(p_cem102);
+                    }
                 }
             }
         }

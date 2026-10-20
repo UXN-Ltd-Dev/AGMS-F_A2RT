@@ -21,8 +21,8 @@
 #include <swmTrace_api.h>
 #include <ble_bass.h>
 #include "app_customss.h"
-/* Application headers */
-#include "app_temperature_sensor.h"
+
+
 
 /* Struct containing values needed for battery level calculation */
 static struct app_batt_read_t app_batt_read;
@@ -227,34 +227,3 @@ void LSAD_ChannelInit(void)
 }
 
 
-uint32_t App_VBAT_Measure(void)
-{
-    struct F_LSAD_TRIM *gain_offset = &g_f_lsad_gain_offset[RSL15_VBAT_CHANNEL];
-    float lsad_rsl15_result = 0.0f;
-    uint32_t rsl15_vbat_mV;
-
-
-	/* Calculating voltage using gain and offset and multiplying by 2 since
-	 * VBAT is divided by 2 when measured by the LSAD. */
-	if (gain_offset->hf_gain != 0)
-	{
-		/* Computing LSAD result using the LSAD full scale of 2.0V and LSAD resolution
-		 * of 14 bits */
-		lsad_rsl15_result = CONVERT(LSAD->DATA_TRIM_CH[RSL15_VBAT_CHANNEL]) / V_TO_MV_F;
-
-		/* Applying offset and gain compensation to calculated voltage value */
-		rsl15_vbat_mV = (uint32_t)(((lsad_rsl15_result - gain_offset->hf_offset) /
-				gain_offset->hf_gain * V_TO_MV) * LSAD_VBAT_FACTOR);
-	}
-
-	/* Calculating voltage using only reference voltage and LSAD data if gain is 0 */
-	else
-	{
-		rsl15_vbat_mV = ((LSAD_VOLTAGE_RANGE_MV * LSAD_VBAT_FACTOR *
-						  LSAD->DATA_TRIM_CH[RSL15_VBAT_CHANNEL]) / (LSAD_MAX_SIZE));
-	}
-
-    vbat_status = VBAT_DONE;
-
-    return (uint32_t)(rsl15_vbat_mV/10);
-}

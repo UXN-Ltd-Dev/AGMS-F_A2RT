@@ -1,0 +1,1648 @@
+/**
+ * @file  app_max30123.c
+ * @brief CEM102 low power application initialization and operation file
+ *        source file
+ *
+ * @copyright @parblock
+ * Copyright (c) 2024 Semiconductor Components Industries, LLC (d/b/a
+ * onsemi), All Rights Reserved
+ *
+ * This code is the property of onsemi and may not be redistributed
+ * in any form without prior written permission from onsemi.
+ * The terms of use and warranty for this code are covered by contractual
+ * agreements between onsemi and the licensee.
+ *
+ * This is Reusable Code.
+ * @endparblock
+ */
+
+#include <hw.h>
+#include <app.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#include "app.h"
+
+#include "app_cem102.h"
+#include "app_utils.h"
+#include "app_customss.h"
+
+#if APP_MEASURE_ACROSS_IO_INPUTS
+#include "math.h"
+#endif /* APP_MEASURE_ACROSS_IO_INPUTS */
+
+#include "app_max30123.h"
+#include <max30123_reg_table.h>
+
+extern uint8_t custom_conidx;
+
+#define CHRONO_A_MEASURE_TIME			(2u)				//
+
+#if 0
+#define CA_TSSP_SEC             40u
+#define CA_AUTO_CLK_DIV_MSB     0x14u
+#define CA_AUTO_CLK_DIV_MID     0x00u
+#define CA_AUTO_CLK_DIV_LSB     0x00u
+#endif
+
+/* M1 슬롯 — SRD = 0 (매 tSSP).
+ * ★ enable/disable 로 게이팅하므로 SRD 는 반드시 0 이어야 한다.
+ *   SRD 를 29 로 두면 M1 을 켠 뒤 최대 30 tSSP 를 더 기다린다. */
+#define CA_M1_CFG_ON            ((uint8_t)(MN_MODE_CHRONO_A << MN_MODE_SHIFT))  /* 0x40 */
+#define CA_M1_CFG_OFF           0x00u
+
+#define CA_POLL_SEC              2u     /* FIFO 확인 주기 [s] — 1회 약 2ms */
+#define CA_WAIT_MARGIN_SEC       5u
+#define CA_RELAX_SEC            15u     /* 재측정 전 전극 이완 (≥5τ) */
+#define CA_RETRY_MAX             2u     /* 프로브 → 정식 행, 1회면 충분 */
+#define CA_DC_DISCARD_N          5u     /* chrono 후 버릴 PSTAT 샘플 수 */
+
+
+/* ==========================================================================
+ * SPS 테이블
+ *   전 행 STEP 100 샘플. ISP 를 2배씩 올려 τ 를 2배씩 커버.
+ *   div 가 전부 2의 거듭제곱이라 isp_sec 이 float 에서 정확히 표현된다.
+ *   duration_ms = (PRE 4 + STEP 100 + BLANK 1) × ISP = 105 × ISP
+ *   CONV_TIME 은 각 ISP 미만에서 최대값 — 노이즈 ∝ 1/√(적분시간)
+ * ========================================================================== */
+const chrono_A_cfg_t chrono_A_cfg[CHRONO_SPS_COUNT] = {
+/*     div      isp_sec       m1_conv                            conv_sec  dur_ms */
+    { 0x0080u, 0.00390625f, MN_CONV_SIGNED(CONV_TIME_2_76MS), 0.00276f,   411u },
+    { 0x0100u, 0.00781250f, MN_CONV_SIGNED(CONV_TIME_2_76MS), 0.00276f,   821u },
+    { 0x0200u, 0.01562500f, MN_CONV_SIGNED(CONV_TIME_2_76MS), 0.00276f,  1641u },
+    { 0x0400u, 0.03125000f, MN_CONV_SIGNED(CONV_TIME_20MS),   0.020f,    3282u },
+    { 0x0800u, 0.06250000f, MN_CONV_SIGNED(CONV_TIME_40MS),   0.040f,    6563u },
+    { 0x1000u, 0.12500000f, MN_CONV_SIGNED(CONV_TIME_100MS),  0.100f,   13125u },
+    { 0x2000u, 0.25000000f, MN_CONV_SIGNED(CONV_TIME_200MS),  0.200f,   26250u }
+};
+
+/* NULL 로 시작한다. max30123_chrono_cfg_apply() 가 호출되기 전에 측정하면
+ * 칩에 쓰지 않은 설정을 쓴 것처럼 믿게 되므로, 첫 실행에서 바로 드러나게 한다. */
+const chrono_A_cfg_t *ca_active_cfg = NULL;
+uint8_t               ca_active_idx = 0xFFu;
+
+max30123_fifo_t      max30123_fifo;
+impedance_result_t   impedance_result[CA_Z_FREQ_COUNT];
+impedance_calendar_t impedance_calendar;
+
+ca_range_state_e     ca_range_state  = CA_RANGE_PROBE;
+uint8_t              ca_result_valid = 0u;
+uint8_t 			 ca_set_done = 0u;
+
+ca_fit_t             ca_fit;
+
+/* STEP 누적기 — 드레인이 버스트 중간에 걸려도 다음 드레인에서 이어받는다 */
+static chrono_a_raw_t ca_acc;
+
+//static uint16_t cal_offset = 0u;
+
+uint8_t max30123_measure_step = MAX30123_STEP_CALIBRATION;
+uint8_t max30123_chrono_A_step = 0u;
+uint8_t max30123_chrono_A_wait_count = 0;
+uint16_t max30123_chrono_A_measure_tmout = 0;
+
+uint8_t max30123_convert_mode = 0u;
+uint16_t max30123_auto_mode_count = 0;
+
+chron_A_sps_e max30123_chrono_A_count = 0;
+
+
+static uint8_t  ca_target_row  = (uint8_t)CA_PROBE_ROW;
+static uint16_t ca_wait_s      = 0u;
+static uint16_t ca_deadline_s  = 0u;
+static uint8_t  ca_retry       = 0u;
+
+
+/************************************************************************************************************************
+ *   SPI CONTROL
+ ************************************************************************************************************************/
+int spidrv_write_max30123_reg_action(const  uint8_t reg,  const uint8_t  val)
+{
+    int result;
+    uint8_t buffer[4];
+
+    buffer[0] = val;
+    result=cem102->max30123_write_reg_action(cem102_dut,   reg, buffer, 1);
+
+    return result;
+}
+
+/******************************************************************************************
+ *	reg 값을 1개씩 읽어 온다
+ ******************************************************************************************/
+uint8_t spidrv_read_max30123_reg_action(const  uint8_t reg)
+{
+    int result;
+    uint8_t buffer[4];
+
+    result=cem102->max30123_read_reg_action(cem102_dut,  reg, buffer, 1);
+
+    if (result == ERRNO_NO_ERROR) {
+        return buffer[0];
+    }
+
+    return 0;
+}
+
+/******************************************************************************************
+ *	DATA BUFFER 만큼 wlen만큼 전송 한다
+ ******************************************************************************************/
+int spidrv_write_max30123_reg_buffer(const  uint8_t reg, uint8_t *wbuffer, uint16_t wlen)
+{
+    int result;
+
+    result=cem102->max30123_write_reg_action(cem102_dut, reg, wbuffer, wlen);
+    return result;
+}
+
+/******************************************************************************************
+ *	DATA BUFFER 만큼 rlen만큼 읽어 온다.
+ ******************************************************************************************/
+int spidrv_read_max30123_reg_buffer(const  uint8_t reg, uint8_t *rbuffer, uint16_t rlen)
+{
+    int result;
+
+    result = cem102->max30123_read_reg_action(cem102_dut,  reg, rbuffer, rlen);
+
+    return result;
+}
+
+
+void max30123_delay_ms(int i)
+{
+	do {
+		Sys_Delay(SystemCoreClock / 1000);	// 1ms wait
+	} while(i-->0);
+}
+
+/************************************************************************************************************************
+ *   mac30123 value memory attach
+ ************************************************************************************************************************/
+void max30123_malloc_attach(void)
+{
+	memset(&impedance_result, 0, sizeof(impedance_result_t));
+	memset(&impedance_calendar, 0, sizeof(impedance_calendar_t));
+
+}
+
+/*************************************************************************************************************************
+ * 	MAX30132 REGISTER INITIAL
+ *************************************************************************************************************************/
+void max30123_reg_initial(void)
+{
+	uint8_t i;
+	uint8_t  result;
+
+	max30123_malloc_attach();
+
+	swmLogInfo("\r\nSERIAL ID : ");
+	for(i=0;i<5;i++) {
+		result = spidrv_read_max30123_reg_action(0xAA+i);
+		swmLogInfo("[0x%02X] ", result);
+	}
+	swmLogInfo("\r\n");
+
+	result = spidrv_read_max30123_reg_action(0xFE);
+#ifdef _MAX30123_INFO_DEBUG_
+	swmLogInfo(" FE : [0x%02X]\r\n", result);
+#endif
+
+	result = spidrv_read_max30123_reg_action(PART_IDENTIFIER);
+#ifdef _MAX30123_INFO_DEBUG_
+	swmLogInfo(" FF : [0x%02X]\r\n", result);
+#endif
+
+	if(result == MAX30123_PART_ID) {
+		for(i=0;i<MAX30123_TBL_SIZE;i++) {
+			spidrv_write_max30123_reg_action(max30123_reg_tbl[i].reg, max30123_reg_tbl[i].val);
+		}
+	}
+}
+
+
+/***********************************************************************************************************************
+ *		MAX30132  INITIAL & POWER ON STATUS WAIT...1초 동안 기다린다...
+ *		POWER ON 이 된 뒤 전원 안정화를 위해 2초 뒤 주파수 초기화를 한다...
+ ***********************************************************************************************************************/
+void max30123_power_on_ready(void)
+{
+	uint8_t tmout;
+	uint8_t status;
+
+	tmout = 200;
+
+#ifdef _MAX30123_INFO_DEBUG_
+		swmLogInfo("Software Reset\r\n");
+#endif
+
+	spidrv_write_max30123_reg_action(MAX30123_REG_SYSCTRL1, SYSCTRL1_RESET);
+
+	do {
+		status = spidrv_read_max30123_reg_action(MAX30123_REG_STATUS1);
+
+#ifdef _MAX30123_INFO_DEBUG_
+		swmLogInfo("STATUS_1 : %02X\r\n", status);
+#endif
+
+		if((status&STATUS1_PWR_RDY)==STATUS1_PWR_RDY_OK) {
+			break;
+		}
+
+		Sys_Delay(SystemCoreClock / 100);				// 10ms wait
+	} while(tmout-->0);
+}
+
+/********************************************************************************
+ *	600mV, 600mV --> 800mV, 600mV ==> 200mV
+ ********************************************************************************/
+void max30123_DAC_power_on(void)
+{
+	spidrv_write_max30123_reg_action(MAX30123_REG_DACA_MSB, 0xC8);
+	spidrv_write_max30123_reg_action(MAX30123_REG_DACB_MSB, 0x96);
+}
+
+/********************************************************************************
+ *
+ ********************************************************************************/
+void max30123_PSTAT_config_Idle_mod(const uint8_t idle_mode)
+{
+	uint8_t reg_val = 0;
+
+	reg_val = spidrv_read_max30123_reg_action(MAX30123_REG_WE1_CFG1);
+
+	if(idle_mode==ENABLE) {
+		spidrv_write_max30123_reg_action(MAX30123_REG_PSTAT_CFG, 0x0F);		// POR_DUTY(1) | HALF_CP_CLK(1) | AFE_CHOP_EN(1) | HALF_IB(1)
+
+		reg_val|=WE1_CFG1_CHOP_EN;
+		spidrv_write_max30123_reg_action(MAX30123_REG_WE1_CFG1, reg_val);
+	}
+	else {
+		spidrv_write_max30123_reg_action(MAX30123_REG_PSTAT_CFG, 0x0A);		// POR_DUTY(1) | HALF_CP_CLK(0) | AFE_CHOP_EN(1) | HALF_IB(0)
+
+		reg_val&=~WE1_CFG1_CHOP_EN;
+		spidrv_write_max30123_reg_action(MAX30123_REG_WE1_CFG1, reg_val);
+	}
+}
+
+/********************************************************************************
+ *	CONVERTER MODE : AUTO MODE & MANUAL MODE
+ ********************************************************************************/
+void max30123_reg_convert_mode(uint8_t mode, uint8_t converter)
+{
+	uint8_t reg_val = 0;
+
+	reg_val = spidrv_read_max30123_reg_action(MAX30123_REG_CONVERT_MODE);
+	reg_val&= 0xFC;
+	reg_val = (reg_val | mode | converter);
+
+	spidrv_write_max30123_reg_action(MAX30123_REG_CONVERT_MODE, reg_val);
+}
+
+
+
+/********************************************************************************
+ * CONVERT MODE START
+ * STATUS 1 상태 확인
+ ********************************************************************************/
+uint8_t max30123_reg_convert_and_status(void)
+{
+	uint8_t results = 0;
+	uint8_t status = 0;
+	int loop = 300;
+
+	spidrv_write_max30123_reg_action(MAX30123_REG_CONVERT_MODE, CONVERT_MODE_CONVERT);
+
+	do {
+		status = spidrv_read_max30123_reg_action(MAX30123_REG_STATUS1);
+		if (status & STATUS1_ADC_DATA_RDY) {
+			results = 1;
+			break;
+		} else {
+			max30123_delay_ms(10);
+		}
+	} while (loop--> 0);
+
+	return results;
+}
+
+/* ==========================================================================
+ * 코드 → 전류 변환
+ *   AUTO_SUBTRACT=1, I_CONV_TYPE=signed → 16bit 2's complement
+ *   I[nA] = FS × (int16)raw / 32768
+ * ========================================================================== */
+static inline float ca_code_to_nA(uint16_t raw)
+{
+    return CA_FS_NA * ((float)(int16_t)raw / 32768.0f);
+}
+
+static inline float dc_code_to_nA(uint16_t raw)
+{
+    return MAX30123_DC_FS_NA * ((float)(int16_t)raw / 32768.0f);
+}
+
+
+/********************************************************************************
+ * @brief 현재 FIFO에 저장된 유효 샘플 수를 확인합니다.
+ * @return 읽기 가능한 샘플 수 (0~256)
+ ********************************************************************************/
+uint16_t max30123_get_fifo_count(void)
+{
+	uint8_t buf[2];
+	spidrv_read_max30123_reg_buffer(MAX30123_REG_FIFO_COUNTER1, buf, 2);
+	return  (uint16_t)(((buf[0] & 0x80) << 1) | buf[1]);
+}
+
+uint8_t max30123_get_fifo_ovf(void)
+{
+    uint8_t buf[2];
+    spidrv_read_max30123_reg_buffer(MAX30123_REG_FIFO_COUNTER1, buf, 2);
+    return (uint8_t)(buf[0] & 0x7Fu);           /* OVF_COUNTER[6:0] */
+}
+/********************************************************************************
+ * @brief FIFO에서 샘플 1개를 읽어옵니다.
+ * @param sample 읽어온 데이터를 저장할 구조체 포인터
+ * @return 성공 시 true, FIFO가 비어있으면 false
+ ********************************************************************************/
+int8_t max30123_read_fifo_data(max30123_fifo_t *p)
+{
+	uint8_t buf[3];
+
+    cem102->max30123_read_reg_action(cem102_dut, MAX30123_REG_FIFO_DATA, buf, 3);
+
+    if (buf[0] == 0xFF && buf[1] == 0xFF && buf[2] == 0xFF) {
+        return 0;
+    }
+
+    p->meas_id   = (buf[0] >> 5) & 0x07;
+    p->data_type = buf[0] & 0x1F;
+    p->adc_val   = (uint16_t)((buf[1] << 8) | buf[2]);
+
+#if _MAX30123_INFO_DEBUG_
+	swmLogInfo("fifo_data : [%02x][%02x][%02x] \r\n", p->meas_id, p->data_type, p->adc_val);
+    max30123_delay_ms(1u);
+#endif
+
+    return 1;
+}
+
+void max30123_fifo_flush(void)
+{
+    /* FIFO_RO 는 넣지 않는다 — 켜지면 오버플로 시 오래된 데이터를 덮어써서
+     * 버스트 앞부분이 조용히 사라진다. OFF 면 뒤가 잘리고 OVF 로 검출된다. */
+    spidrv_write_max30123_reg_action(MAX30123_REG_FIFO_CONFIG2,
+                                     FIFO_CFG2_FLUSH_FIFO
+                                   | FIFO_CFG2_FIFO_STAT_CLR
+                                   | FIFO_CFG2_A_FULL_TYPE);
+}
+
+
+
+
+/***********************************************************************************************************************
+ *	#1. MAX30123 measure calibration
+ ***********************************************************************************************************************/
+#define CAL_OFFSET_EXPECT   32768u    /* OFFSET_SEL = 50% FS 기대 카운트 */
+#define CAL_OFFSET_TOL       6554u    /* ±20% — 실측 산포로 조일 것   */
+uint8_t max30123_measure_calibration(uint16_t *offset_out)
+{
+    uint8_t m0_cfg;
+    uint8_t saved_conv, saved_avg, saved_cfg2;
+    uint8_t off_buf[2];
+    uint16_t stored;
+	uint16_t fifo_count;
+
+    if (offset_out == NULL) { return 0u; }
+    *offset_out = 0u;
+
+	spidrv_write_max30123_reg_action(MAX30123_REG_PSTAT_CFG, 0x0F);		// POR_DUTY(1) | HALF_CP_CLK(1) | AFE_CHOP_EN(1) | HALF_IB(1)
+/*************************************************************************************
+ *	STEP 0 : M0 가 PSTAT(Amperometric) 인지 확인.
+ *	 		아니면 offset-only 측정 자체가 일어나지 않는다.
+ *************************************************************************************/
+    m0_cfg = spidrv_read_max30123_reg_action(MAX30123_REG_M0_CFG);
+    if (((m0_cfg >> 5) & 0x07u) != MN_MODE_PSTAT) {
+        return 0u;
+    }
+
+#if _EIS_FIFO_INFO_DEBUG_
+	swmLogInfo("[CAL] M0_MODE PSTAT : 0x%02X, 0x%02X\r\n", m0_cfg, ((m0_cfg >> 5) & 0x07u));
+#endif
+
+// STEP 1 : STORE_OFFSET = 1
+    saved_cfg2 = spidrv_read_max30123_reg_action(MAX30123_REG_WE1_CFG2);
+    spidrv_write_max30123_reg_action(MAX30123_REG_WE1_CFG2,
+                                     saved_cfg2 | WE1_CFG2_STORE_OFFSET);
+#if _EIS_FIFO_INFO_DEBUG_
+	swmLogInfo("MAX30123_REG_WE1_CFG2 : [0x%02X] \r\n", saved_cfg2);
+#endif
+
+// STEP 2 : M0 I_CONV_TYPE → 01 (Offset only)
+	saved_conv = spidrv_read_max30123_reg_action(MAX30123_REG_M0_CONV);
+	spidrv_write_max30123_reg_action(MAX30123_REG_M0_CONV,
+								 (saved_conv & 0x3Fu)
+							   | (I_CONV_OFFSET_ONLY << MN_I_CONV_TYPE_SHIFT));
+
+#if _EIS_FIFO_INFO_DEBUG_
+	swmLogInfo("MAX30123_REG_M0_CONV : [0x%02X] \r\n", saved_conv);
+#endif
+
+//	STEP 3 : 1회 보정이므로 MEAS_AVE로 충분히 평균. SMP_AVE는 AUTO=1 전용이라 Manual 단발에서는 반드시 0.
+	saved_avg = spidrv_read_max30123_reg_action(MAX30123_REG_M0_AVG);
+	spidrv_write_max30123_reg_action(MAX30123_REG_M0_AVG, MEAS_AVE_8);
+
+//	STEP 4 : AFE 정착 대기 (초퍼 + 오프셋 전류. 실측으로 조정)
+    max30123_delay_ms(50u);
+
+//----------------------------------------------------------------------------------------------------------------------------------------
+// STEP 5 : FIFO flush
+	spidrv_write_max30123_reg_action(MAX30123_REG_FIFO_CONFIG2,
+										FIFO_CFG2_FLUSH_FIFO |
+										FIFO_CFG2_FIFO_STAT_CLR |
+										FIFO_CFG2_A_FULL_TYPE);
+
+	if(max30123_reg_convert_and_status() == 0)
+		goto cleanup;								// 복원 후 나와야 한다..
+
+// STEP 6 : FIFO에서 캘리브레이션 데이터 읽기 (버려도 됨)
+	fifo_count = max30123_get_fifo_count();
+	while (fifo_count > 0u) {
+	    max30123_read_fifo_data(&max30123_fifo);
+	    fifo_count--;
+	}
+
+
+// STEP 5 : WE1_I_OFFSET 검증
+	spidrv_read_max30123_reg_buffer(MAX30123_REG_WE1_I_OFFSET_MSB, off_buf, 2);
+
+    stored = ((uint16_t)off_buf[0] << 8) | off_buf[1];
+	*offset_out = stored;
+
+    if ((stored > (CAL_OFFSET_EXPECT + CAL_OFFSET_TOL)) ||
+        (stored < (CAL_OFFSET_EXPECT - CAL_OFFSET_TOL))) {
+#if _EIS_FIFO_INFO_DEBUG_
+        swmLogInfo("[CAL] offset out of range : %u (expect ~%u)\r\n",
+                   stored, CAL_OFFSET_EXPECT);
+#endif
+        goto cleanup;
+    }
+
+#if _EIS_FIFO_INFO_DEBUG_
+	swmLogInfo("WE1_I_OFFSET : 0x%02X 0x%02X [%d] \r\n", off_buf[0], off_buf[1], stored);
+#endif
+
+cleanup:
+    spidrv_write_max30123_reg_action(MAX30123_REG_WE1_CFG2,
+    								saved_cfg2  & ~WE1_CFG2_STORE_OFFSET);
+    spidrv_write_max30123_reg_action(MAX30123_REG_M0_AVG, saved_avg);
+    spidrv_write_max30123_reg_action(MAX30123_REG_M0_CONV,
+                                     (saved_conv & 0x3Fu)
+                                   | (I_CONV_SIG_SIGNED << MN_I_CONV_TYPE_SHIFT));
+
+    return 1;
+}
+
+/***********************************************************************************************************************
+ *	#2-1. MAX30123 measure DC current... 수동 모두
+ ***********************************************************************************************************************/
+uint8_t max30123_measure_DC_manual_mode(float *we_current)
+{
+    int16_t signed_raw;
+    uint16_t fifo_count;
+    float nA;
+
+    /* FIFO flush */
+    spidrv_write_max30123_reg_action(MAX30123_REG_FIFO_CONFIG2,
+                                     FIFO_CFG2_FLUSH_FIFO |
+                                     FIFO_CFG2_FIFO_STAT_CLR);
+
+	if(max30123_reg_convert_and_status() == 0)
+		return 0;
+
+	fifo_count = max30123_get_fifo_count();
+	while (fifo_count > 0u) {
+		max30123_read_fifo_data(&max30123_fifo);
+		if(max30123_fifo.data_type == FIFO_TYPE_WE1_PSTAT_CURR) {
+			signed_raw = (int16_t)max30123_fifo.adc_val;
+			nA = ((float)signed_raw / 128.0f);
+			*we_current = nA;
+
+#if _EIS_FIFO_INFO_DEBUG_
+	swmLogInfo("WE1 : %d, "LOG_FLOAT_MARKER" nA  \r\n ", signed_raw, LOG_FLOAT(nA));
+	max30123_delay_ms(1);
+#endif
+    	}
+
+    	fifo_count--;
+	}
+
+    return 1;
+}
+
+
+
+/***********************************************************************************************************************
+ *	#2-2. MAX30123 measure DC current... 수동 모두
+ ***********************************************************************************************************************/
+uint8_t max30123_measure_DC_auto_mode(float *we_current)
+{
+	uint8_t status = 0;
+    int16_t signed_raw;
+    uint16_t fifo_count;
+    float nA;
+
+
+	status = spidrv_read_max30123_reg_action(MAX30123_REG_STATUS1);
+#if _EIS_FIFO_INFO_DEBUG_
+	swmLogInfo("MAX30123_REG_STATUS1 : %02x \r\n ", status);
+#endif
+
+	if (status & STATUS1_ADC_DATA_RDY) {
+		fifo_count = max30123_get_fifo_count();
+#if _EIS_FIFO_INFO_DEBUG_
+		swmLogInfo("fifo_count : %d\r\n ", fifo_count);
+		max30123_delay_ms(1);
+#endif
+
+		while (fifo_count > 0u) {
+			max30123_read_fifo_data(&max30123_fifo);
+
+			if(max30123_fifo.data_type == FIFO_TYPE_WE1_PSTAT_CURR) {
+				signed_raw = (int16_t)max30123_fifo.adc_val;
+				nA = ((float)signed_raw / 128.0f);
+				*we_current = nA;
+
+#if _EIS_FIFO_INFO_DEBUG_
+				swmLogInfo("WE1 : %d, "LOG_FLOAT_MARKER" nA  \r\n ", signed_raw, LOG_FLOAT(nA));
+				max30123_delay_ms(1);
+#endif
+	    	}
+
+	    	fifo_count--;
+		}
+
+		return 1;
+	}
+
+	return 0;
+}
+
+
+/************************************************************************************
+ *	#3-1. max30123 chronoamperometry measurement...auto mode
+ ************************************************************************************/
+uint8_t max30123_chrono_A_measurement_auto_mode(chrono_a_raw_t *out)
+{
+	uint8_t status = 0;
+	uint16_t fifo_count;
+	float	nA;
+
+#if _EIS_FIFO_INFO_DEBUG_
+    swmLogInfo("max30123_chrono_A_measurement\r\n");
+#endif
+
+	status = spidrv_read_max30123_reg_action(MAX30123_REG_STATUS1);
+    swmLogInfo("chrono_A : %02x\r\n", status);
+
+	if (status & STATUS1_ADC_DATA_RDY) {
+
+	    // 2. FIFO 엔트리 수 확인
+	    fifo_count = max30123_get_fifo_count();
+
+#if _EIS_FIFO_INFO_DEBUG_
+	    swmLogInfo("[CA] FIFO count=%d\r\n", fifo_count);
+#endif
+
+	    if (fifo_count == 0u) {					// FIFO가 없거나 너무 많은 숫자가 들어 오면
+
+#if _EIS_FIFO_INFO_DEBUG_
+	        swmLogInfo("[CA] ERR: FIFO empty\r\n");
+#endif
+	        return 0u;
+	    }
+
+	    out->n_step = 0;
+
+	    // 3. FIFO 읽기 루프
+	    while(fifo_count > 0) {
+	        max30123_read_fifo_data(&max30123_fifo);
+
+	        if (max30123_fifo.meas_id != CA_MEAS_M1) {		// M1(Chrono A) 데이터만 처리. M0 PSTAT 값은 SKIP
+	            continue;
+	        }
+
+	        nA = ca_code_to_nA(max30123_fifo.adc_val);
+
+	        switch(max30123_fifo.data_type) {
+	        	case FIFO_TYPE_WE1_PSTAT_CURR:
+	        		break;
+
+	        	case FIFO_TYPE_WE1_PRE:
+					break;
+
+				case FIFO_TYPE_WE1_STEP:
+					out->step_nA[out->n_step++] = nA;
+					break;
+
+				default:
+					break;
+	        }
+
+	#if _EIS_FIFO_INFO_DEBUG_
+	        swmLogInfo("FIFO : [%d]--> 0x%02X, %d\r\n", fifo_count, max30123_fifo.data_type, (int16_t)max30123_fifo.adc_val);
+	#endif
+	    	fifo_count--;
+	    }
+
+	    if (out->n_step == 0u) {
+	#if _EIS_FIFO_INFO_DEBUG_
+	        swmLogInfo("[CA] ERR: 샘플 부족\r\n");
+	#endif
+	        return 0u;
+	    }
+	#if _EIS_FIFO_INFO_DEBUG_
+	        swmLogInfo("max30123_chrono_A_measurement success\r\n");
+	#endif
+
+		return 1;
+
+	}
+
+	return 0;
+}
+
+
+/************************************************************************************
+ *	#3-2. max30123 chronoamperometry measurement...manual mode
+ ************************************************************************************/
+uint8_t max30123_chrono_A_measurement_manual_mode(chrono_a_raw_t *out)
+{
+    uint8_t  ok = 0u;
+
+#if 0
+    const chrono_A_cfg_t *c = ca_active_cfg;
+    uint8_t  saved_m1, cmode, status;
+    uint16_t fifo_count, i, need;
+    uint32_t elapsed = 0u;
+    uint32_t timeout_ms;
+
+    if ((out == NULL) || (c == NULL)) { return 0u; }
+
+    out->n_step  = 0u;
+    out->isp_sec = c->isp_sec;
+    out->rate    = (uint8_t)ca_active_idx;
+
+  //  need       = c->
+    timeout_ms = c->conv_sec + CA_MANUAL_MARGIN_MS;
+
+    // 1. 진행 중인 변환이 있으면 정지 (CONVERT 1->1 은 무시된다)
+    cmode = spidrv_read_max30123_reg_action(MAX30123_REG_CONVERT_MODE);
+    if ((cmode & CONVERT_MODE_CONVERT) != 0u) {
+        spidrv_write_max30123_reg_action(MAX30123_REG_CONVERT_MODE, 0x00u);
+        do {
+            status = spidrv_read_max30123_reg_action(MAX30123_REG_STATUS1);
+            if ((status & STATUS1_SEQ_RDY) != 0u) { break; }
+            max30123_delay_ms(1u);
+            elapsed++;
+        } while (elapsed < CA_SEQ_STOP_TMOUT_MS);
+        elapsed = 0u;
+    }
+
+    // 2. 슬롯 구성 : M1 = Chrono A
+    saved_m1 = spidrv_read_max30123_reg_action(MAX30123_REG_M1_CFG);
+    spidrv_write_max30123_reg_action(MAX30123_REG_M1_CFG, (uint8_t)(MN_MODE_CHRONO_A << MN_MODE_SHIFT));
+
+    // 3. FIFO flush
+    spidrv_write_max30123_reg_action(MAX30123_REG_FIFO_CONFIG2,
+                                     FIFO_CFG2_FLUSH_FIFO
+                                   | FIFO_CFG2_FIFO_STAT_CLR
+                                   | FIFO_CFG2_A_FULL_TYPE);
+
+    // 4. 단발 변환
+    max30123_delay_ms(1u);              /* CONVERT 0->1 은 4 SR_CLK 이후 */
+    spidrv_write_max30123_reg_action(MAX30123_REG_CONVERT_MODE,
+                                     CONVERT_MODE_CONVERT);
+
+    // 5. CONVERT 자동 clear 대기
+    do {
+        SYS_WATCHDOG_REFRESH();
+
+        max30123_delay_ms(CA_POLL_INTERVAL_MS);
+        elapsed += CA_POLL_INTERVAL_MS;
+
+        fifo_count = max30123_get_fifo_count();
+        if (fifo_count >= need) { break; }
+
+    } while (elapsed < timeout_ms);
+
+    spidrv_write_max30123_reg_action(MAX30123_REG_CONVERT_MODE, CONVERT_MODE_STOP);
+    spidrv_write_max30123_reg_action(MAX30123_REG_M1_CFG, saved_m1);
+
+    // 6. FIFO 파싱
+    if (fifo_count > MAX30123_FIFO_DEPTH) { fifo_count = MAX30123_FIFO_DEPTH; }
+
+    for (i = 0u; i < fifo_count; i++) {
+        if (max30123_read_fifo_data(&max30123_fifo) == 0) {	break;	}
+
+        if ((max30123_fifo.meas_id   != CA_MEAS_M1) ||
+            (max30123_fifo.data_type != FIFO_TYPE_WE1_STEP)) {	continue;	}
+
+        if (out->n_step < need) {
+            out->step_nA[out->n_step++] = ca_code_to_nA(max30123_fifo.adc_val);
+        }
+    }
+
+    ok = (out->n_step == (need-1)) ? 1u : 0u;
+
+#endif
+
+    return ok;
+}
+
+/*******************************************************************
+ *  max30123_impedance_measurement
+ *
+ *  Chrono A STEP + POST 샘플로 10Hz DFT 수행 → Z 계산
+ *
+ *  전압 파형 정의:
+ *    k = 0 ~ n_step-1 : V = +CA_VSTEP_MV (+30mV)
+ *    k = n_step ~ N-1 : V =  CA_VPOST_MV  (0mV, baseline 복귀)
+ *
+ *  DFT (e^(-j2π×f×k×ISP)):
+ *    X_real = Σ x[k] × cos(2π × f × k × ISP)
+ *    X_imag = Σ x[k] × sin(2π × f × k × ISP)   (부호 주의: -j → -sin)
+ *
+ *  Z 계산 (복소수 나눗셈):
+ *    Z = V_DFT / I_DFT
+ *    Z_real = (V_re×I_re + V_im×I_im) / |I|²  × 1e6  [Ω]
+ *    Z_imag = (V_im×I_re - V_re×I_im) / |I|²  × 1e6  [Ω]
+ *    (×1e6: mV/nA → V/A = Ω)
+ ********************************************************************/
+
+uint8_t max30123_impedance_calcualtion(const chrono_a_raw_t *in, impedance_result_t *out)
+{
+#if 0
+
+    float   v_re = 0.0f, v_im = 0.0f;
+    float   i_re = 0.0f, i_im = 0.0f;
+    float   i_mag_sq;
+    float   phase;
+    float   v_k, i_k;
+    float   FREQ_HZ, ISP_SEC;
+
+    uint8_t k;
+    uint8_t in_step;
+    uint8_t cycle, step_pos, post_k, post_pos;
+    uint32_t t_idx;  										/* 절대 시간 인덱스 */
+
+    uint8_t n_per_cycle = CA_STEP_COUNT + CA_POST_COUNT;  	/* 11 */
+    uint8_t n_total     = in->n_step + in->n_post;        	/* 44 */
+
+    double z_real, z_imag, z_mag, z_phase_deg;
+
+    if (out == NULL || n_total == 0u) {
+        return 0u;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    for (k = 0u; k < n_total; k++) {
+
+        in_step = (k < in->n_step);   									// k<32: STEP,  k>=32: POST
+
+        v_k = in_step ? CA_VSTEP_MV : CA_VPOST_MV;						// 전압
+        i_k = in_step ? in->step_nA[k] : in->post_nA[k - in->n_step];	// 전류
+
+        if (in_step) {
+            cycle    = k / CA_STEP_COUNT;        	 					// 몇 번째 사이클
+            step_pos = k % CA_STEP_COUNT;         						// 사이클 내 위치
+            t_idx    = (uint32_t)cycle * n_per_cycle + step_pos;
+
+        } else {
+            post_k   = k - in->n_step;
+            cycle    = post_k / CA_POST_COUNT;
+            post_pos = post_k % CA_POST_COUNT;
+            t_idx    = (uint32_t)cycle * n_per_cycle + CA_STEP_COUNT + post_pos;
+        }
+
+#if 0
+        phase = 2.0f * M_PI * CA_FREQ_HZ * (float)t_idx * CA_ISP_SEC;
+#else
+        FREQ_HZ = chrono_setup[max30123_chrono_A_count].freq_hz;
+        ISP_SEC = chrono_setup[max30123_chrono_A_count].isp_sec;
+        phase = 2.0f * M_PI * FREQ_HZ * (float)t_idx * ISP_SEC;
+#endif
+
+#if 0 //#if _EIS_FIFO_INFO_DEBUG_
+		swmLogInfo("Freq = " LOG_FLOAT_MARKER ",  isp sec = " LOG_FLOAT_MARKER "\r\n",
+					LOG_FLOAT(FREQ_HZ), LOG_FLOAT(ISP_SEC));
+		max30123_delay_ms(1);
+#endif
+
+        v_re += v_k * cosf(phase);
+        v_im -= v_k * sinf(phase);
+
+        i_re += i_k * cosf(phase);
+        i_im -= i_k * sinf(phase);
+
+#if _IMPEDANCE_INFO_DEBUG_
+        swmLogInfo("[DFT] k=%2d  V=" LOG_FLOAT_MARKER " mV  I=" LOG_FLOAT_MARKER " nA\r\n", k, LOG_FLOAT(v_k), LOG_FLOAT(i_k));
+        max30123_delay_ms(1);
+#endif
+    }
+
+#if _IMPEDANCE_INFO_DEBUG_
+    swmLogInfo("[DFT] V_re=" LOG_FLOAT_MARKER "  V_im=" LOG_FLOAT_MARKER " mV\r\n", LOG_FLOAT(v_re), LOG_FLOAT(v_im));
+    swmLogInfo("[DFT] I_re=" LOG_FLOAT_MARKER "  I_im=" LOG_FLOAT_MARKER " nA\r\n", LOG_FLOAT(i_re), LOG_FLOAT(i_im));
+    max30123_delay_ms(1);
+#endif
+
+    i_mag_sq = (i_re * i_re) + (i_im * i_im);
+    if (i_mag_sq < 1e-6f) {
+#if _IMPEDANCE_INFO_DEBUG_
+        swmLogInfo("[EIS] ERR: |I|≈0\r\n");
+#endif
+        return 0u;
+    }
+
+    z_real      = (v_re * i_re + v_im * i_im) / i_mag_sq * 1.0e6f;
+    z_imag      = (v_im * i_re - v_re * i_im) / i_mag_sq * 1.0e6f;
+    z_mag       = sqrtf(z_real * z_real + z_imag * z_imag);
+    z_phase_deg = atan2f(z_imag, z_real) * 57.2957914;//(180.0f / M_PI);
+
+    out->z_real 	= (int32_t)z_real;
+    out->z_imag 	= (int32_t)z_imag;
+    out->z_mag 		= (int32_t)z_mag;
+    out->z_phase_deg= (int32_t)z_phase_deg;
+
+
+#if _IMPEDANCE_RESULT_DEBUG_
+    swmLogInfo("*****************************************\r\n");
+    swmLogInfo("[%s] Z_real  = %ld Ohm\r\n", (char *)chrono_name[max30123_chrono_A_count], out->z_real);
+    swmLogInfo("[%s] Z_imag  = %ld Ohm\r\n", (char *)chrono_name[max30123_chrono_A_count], out->z_imag);
+    swmLogInfo("[%s] |Z|     = %ld Ohm\r\n", (char *)chrono_name[max30123_chrono_A_count], out->z_mag);
+    swmLogInfo("[%s] Phase   = %ld deg\r\n", (char *)chrono_name[max30123_chrono_A_count], out->z_phase_deg);
+    swmLogInfo("*****************************************\r\n\r\n");
+#endif
+#endif
+    return 1u;
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+//
+//
+
+
+/*****************************************************************************
+ *  max30123 WE Config
+ *****************************************************************************/
+void max30123_WE1_config_power_on(void)
+{
+	uint8_t regVal;
+
+	/* FIFO Flush */
+    spidrv_write_max30123_reg_action(MAX30123_REG_FIFO_WR_PTR, 0x00);
+    spidrv_write_max30123_reg_action(MAX30123_REG_FIFO_RD_PTR, 0x00);
+
+    regVal = spidrv_read_max30123_reg_action(MAX30123_REG_WE1_CFG1);
+#if _EIS_FIFO_INFO_DEBUG_
+    swmLogInfo("WE1_CFG1 : 0x%02X\r\n", regVal);
+#endif
+
+    regVal = spidrv_read_max30123_reg_action(MAX30123_REG_WE1_CFG2);
+#if _EIS_FIFO_INFO_DEBUG_
+    swmLogInfo("WE1_CFG2 : 0x%02X\r\n", regVal);
+#endif
+
+    regVal = spidrv_read_max30123_reg_action(MAX30123_REG_CE1_CFG);
+#if _EIS_FIFO_INFO_DEBUG_
+    swmLogInfo("CE1_CFG1 : 0x%02X\r\n", regVal);
+#endif
+
+    /* 레지스터 복원 */
+	spidrv_write_max30123_reg_action(MAX30123_REG_WE1_CFG1, 0x82);	// WE1 CONFIG 1: Working Amp Enable
+    spidrv_write_max30123_reg_action(MAX30123_REG_WE1_CFG2, 0xEA);	// WE1 CONFIG 2: Offset Always On = ON
+    spidrv_write_max30123_reg_action(MAX30123_REG_CE1_CFG, 0x91);	// CE1 CONFIG: Counter Amp Enable
+}
+
+
+
+/* ==========================================================================
+ * AUTO 모드 시퀀서
+ * ========================================================================== */
+void max30123_auto_mode_setup(void)
+{
+    /* INTB 미연결 → Hi-Z, 인터럽트 전부 비활성 */
+    spidrv_write_max30123_reg_action(MAX30123_REG_GPIO_SETUP1, GPIO_SETUP1_INTB_UNUSED);
+    spidrv_write_max30123_reg_action(MAX30123_REG_INT_EN1, 0x00u);
+    spidrv_write_max30123_reg_action(MAX30123_REG_INT_EN2, 0x00u);
+
+    /* tSSP = 120s */
+    spidrv_write_max30123_reg_action(MAX30123_REG_AUTO_CLK_DIV_MSB, CA_AUTO_CLK_DIV_MSB);
+    spidrv_write_max30123_reg_action(MAX30123_REG_AUTO_CLK_DIV_MID, CA_AUTO_CLK_DIV_MID);
+    spidrv_write_max30123_reg_action(MAX30123_REG_AUTO_CLK_DIV_LSB, CA_AUTO_CLK_DIV_LSB);
+
+    /* M0 = PSTAT, 매 tSSP.  ★ M0_MODE > 0 이어야 시퀀서가 시작된다 (M0 를 끄면 M1 도 멈춘다)
+     * 0x70 의 기존 테이블 값 0x53 은 bits[7:6]=01 = I_CONV_OFFSET_ONLY 였다 —
+     * 신호가 아니라 오프셋만 읽는 설정. signed(0xD3) 로 바로잡는다. */
+    spidrv_write_max30123_reg_action(MAX30123_REG_M0_CFG,  CA_M0_CFG);
+    spidrv_write_max30123_reg_action(MAX30123_REG_M0_CONV, CA_M0_CONV);
+    spidrv_write_max30123_reg_action(MAX30123_REG_M0_AVG,  CA_M0_AVG);
+
+    /* M1 = Chrono A, SRD 로 스킵 → 60분 주기 */
+    spidrv_write_max30123_reg_action(MAX30123_REG_M1_CFG, CA_M1_CFG);
+
+    /* 사용하지 않는 슬롯은 명시적으로 끈다 */
+    spidrv_write_max30123_reg_action(MAX30123_REG_M2_CFG, 0x00u);
+    spidrv_write_max30123_reg_action(MAX30123_REG_M3_CFG, 0x00u);
+    spidrv_write_max30123_reg_action(MAX30123_REG_M4_CFG, 0x00u);
+
+    /* 프로브 행으로 시작 */
+    max30123_M1_chrono_A_sps(CA_PROBE_ROW);
+    ca_range_state          = CA_RANGE_PROBE;
+    max301123_chrono_A_count = CA_PROBE_ROW;
+}
+
+
+/* 다음 tSSP 경계를 기다리지 않고 시퀀스를 즉시 재시작.
+ * TODO: SEQ_RESTART 동작을 벤치에서 확인. 효과가 없으면 그냥 다음 tSSP 를
+ *       기다리면 된다 (deadline 에 CA_TSSP_SEC 가 이미 포함되어 있다). */
+static void ca_seq_restart(void)
+{
+    uint8_t v = spidrv_read_max30123_reg_action(MAX30123_REG_CONVERT_MODE);
+    spidrv_write_max30123_reg_action(MAX30123_REG_CONVERT_MODE,
+                                     (uint8_t)(v | CONVERT_MODE_SEQ_RESTART));
+}
+
+
+void max30123_auto_mode_start(void)
+{
+    ca_acc.n_step   = 0u;
+    ca_result_valid = 0u;
+
+    max30123_fifo_flush();
+    max30123_delay_ms(1u);                      /* CONVERT 0→1 은 4 SR_CLK 이후 */
+
+    spidrv_write_max30123_reg_action(MAX30123_REG_CONVERT_MODE,
+                                     CONVERT_MODE_AUTO | CONVERT_MODE_CONVERT);
+
+#if _MAX30123_INFO_DEBUG_
+    {
+        uint8_t st = spidrv_read_max30123_reg_action(MAX30123_REG_STATUS1);
+        if ((st & STATUS1_INVALID_CFG) != 0u) {
+            /* 측정 시간 > tSSP 이거나 CONV_TIME ≥ ISP */
+            swmLogInfo("[CA] ERR: INVALID_CFG (st=%02X)\r\n", (unsigned)st);
+        }
+    }
+#endif
+}
+
+void max30123_auto_mode_stop(void)
+{
+    spidrv_write_max30123_reg_action(MAX30123_REG_CONVERT_MODE, CONVERT_MODE_STOP);
+}
+
+void max30123_reg_dump(void)
+{
+    swmLogInfo("[CHK] 35=%02X 37=%02X 38=%02X 39=%02X 3A=%02X 3B=%02X 3C=%02X\r\n",
+        (unsigned)spidrv_read_max30123_reg_action(0x35),
+        (unsigned)spidrv_read_max30123_reg_action(0x37),
+        (unsigned)spidrv_read_max30123_reg_action(0x38),
+        (unsigned)spidrv_read_max30123_reg_action(0x39),
+        (unsigned)spidrv_read_max30123_reg_action(0x3A),
+        (unsigned)spidrv_read_max30123_reg_action(0x3B),
+        (unsigned)spidrv_read_max30123_reg_action(0x3C));
+    max30123_delay_ms(1u);
+    swmLogInfo("[CHK] 15=%02X 16=%02X 17=%02X 18=%02X 19=%02X "
+               "60=%02X 62=%02X 64=%02X 70=%02X 72=%02X\r\n",
+        (unsigned)spidrv_read_max30123_reg_action(0x15),
+        (unsigned)spidrv_read_max30123_reg_action(0x16),
+        (unsigned)spidrv_read_max30123_reg_action(0x17),
+        (unsigned)spidrv_read_max30123_reg_action(0x18),
+        (unsigned)spidrv_read_max30123_reg_action(0x19),
+        (unsigned)spidrv_read_max30123_reg_action(0x60),
+        (unsigned)spidrv_read_max30123_reg_action(0x62),
+        (unsigned)spidrv_read_max30123_reg_action(0x64),
+        (unsigned)spidrv_read_max30123_reg_action(0x70),
+        (unsigned)spidrv_read_max30123_reg_action(0x72));
+    /* 기대값: 35=05  37=C8  38=63  39~3B=00  3C=64
+     *         15=3C 16=00 17=00  60=03  62=20  64=5D  70=D3
+     * ★ 35 가 05 가 아니면 측정하지 말 것 — 모든 R 이 비례해서 틀린다 */
+}
+
+/* ==========================================================================
+ * 3점 프로브 — I∞ 가 소거되는 τ 추정
+ *
+ *    (I₁−I₂)/(I₂−I₃) = e^(Δ/τ)      ← I∞ 가 완전히 사라진다
+ *    τ = Δ / ln[(I₁−I₂)/(I₂−I₃)]
+ *
+ *  창이 τ 를 덮지 못해도 성립한다. 1.56s 창으로 2.35s τ 를 복원 검증.
+ *  정확도 약 26% — 측정값이 아니라 레인지 파인더다 (행이 2배 간격).
+ *  반환 0.0f = "τ ≪ Δ" → 그 버스트를 직접 피팅하거나 한 단 내린다.
+ * ========================================================================== */
+float ca_probe_tau(const chrono_a_raw_t *in)
+{
+    float   i1 = 0.0f, i2 = 0.0f, i3 = 0.0f;
+    float   num, den, d;
+    uint8_t k, gap;
+
+    if ((in == NULL) || (in->n_step < (3u * CA_PROBE_BLK))) { return 0.0f; }
+
+    gap = (uint8_t)((in->n_step - CA_PROBE_BLK) / 2u);      /* 등간격 보장 */
+
+    for (k = 0u; k < CA_PROBE_BLK; k++) {
+        i1 += in->step_nA[k];
+        i2 += in->step_nA[gap + k];
+        i3 += in->step_nA[(uint16_t)(2u * gap) + k];
+    }
+    i1 /= (float)CA_PROBE_BLK;
+    i2 /= (float)CA_PROBE_BLK;
+    i3 /= (float)CA_PROBE_BLK;
+
+    num = i1 - i2;
+    den = i2 - i3;
+
+    if (den < CA_PROBE_DEN_NA) { return 0.0f; }     /* 노이즈 이하 → τ 가 작다 */
+    if (num <= den)            { return 0.0f; }     /* 비 ≤ 1 → 지수 감쇠 아님 */
+
+    d = logf(num / den);
+    if (d < 1e-4f) { return 0.0f; }
+
+    return ((float)gap * in->isp_sec) / d;
+}
+
+/* τ 에 맞는 행 : τ ∈ [5·ISP, 10·ISP] */
+static chron_A_sps_e ca_row_for_tau(float tau)
+{
+    uint8_t i;
+
+    if (tau <= 0.0f) { return (chron_A_sps_e)0; }
+
+    for (i = 0u; i < (uint8_t)CHRONO_SPS_COUNT; i++) {
+        if (tau <= (chrono_A_cfg[i].isp_sec * 10.0f)) { return (chron_A_sps_e)i; }
+    }
+    return (chron_A_sps_e)((uint8_t)CHRONO_SPS_COUNT - 1u);
+}
+
+/* ==========================================================================
+ * 단일 지수 피팅
+ *   I(t) = I∞ + (I₀−I∞)·e^(−t/τ)
+ *   R[Ω] = V[mV] / I[nA] × 1e6
+ *
+ *   ★ 전제 : T ≥ 10τ.  레인지가 맞으면 T/τ ∈ [10,20] 이라 I∞ 바이어스 1% 수준.
+ *     레인지가 틀리면 I∞ 가 무너진다 (T/τ=1.56 에서 +104%).
+ * ========================================================================== */
+uint8_t max30123_step_fit(const chrono_a_raw_t *in, ca_fit_t *out)
+{
+    uint8_t i, cnt = 0u, n_fit;
+    float   y, t, sum = 0.0f;
+    float   sx = 0.0f, sy = 0.0f, sxx = 0.0f, sxy = 0.0f;
+    float   den, slope, icept, i0, rpar, t_off;
+
+    if ((in == NULL) || (out == NULL))                  { return 0u; }
+    if (in->n_step <= (CA_IINF_AVG_N + CA_FIT_MIN_PTS)) { return 0u; }
+
+    memset(out, 0, sizeof(*out));                       /* 부분 기록 방지 */
+    out->n_exp = 1u;
+
+    /* 샘플 i 는 적분 구간 [i·ISP, i·ISP+conv] 의 평균 → 대표 시각은 구간 중심.
+     * 공통 오프셋이라 τ 에는 영향 없고 I₀(=Rs) 만 보정된다. */
+    t_off = in->conv_sec * 0.5f;
+
+    /* ---- 1. I∞ : 꼬리 평균 ---- */
+    for (i = (uint8_t)(in->n_step - CA_IINF_AVG_N); i < in->n_step; i++) {
+        sum += in->step_nA[i];
+    }
+    out->i_inf_nA = sum / (float)CA_IINF_AVG_N;
+    if (out->i_inf_nA < 0.5f) { return 0u; }
+
+    /* ---- 2. ln(I − I∞) 선형 회귀 : 앞 60% ---- */
+    n_fit = (uint8_t)(((uint16_t)in->n_step * CA_FIT_FRAC_NUM) / CA_FIT_FRAC_DEN);
+
+    for (i = 0u; i < n_fit; i++) {
+        y = in->step_nA[i] - out->i_inf_nA;
+        if (y <= CA_Y_FLOOR_NA) { continue; }
+        t = ((float)i * in->isp_sec) + t_off;
+        y = logf(y);
+        sx += t;  sy += y;  sxx += (t * t);  sxy += (t * y);
+        cnt++;
+    }
+    if (cnt < CA_FIT_MIN_PTS) { return 0u; }
+
+    den = ((float)cnt * sxx) - (sx * sx);
+    if ((den > -1e-3f) && (den < 1e-3f)) { return 0u; }     /* float32 상쇄 바닥 */
+
+    slope = (((float)cnt * sxy) - (sx * sy)) / den;         /* = −1/τ */
+    icept = (sy - (slope * sx)) / (float)cnt;               /* = ln(I₀−I∞) */
+
+    if (slope >= -1e-4f) { return 0u; }                     /* τ 발산 차단 */
+
+    out->tau_sec[0] = -1.0f / slope;
+    out->a_nA[0]    = expf(icept);
+
+    i0 = out->i_inf_nA + out->a_nA[0];
+    if ((i0 <= out->i_inf_nA) || (i0 > (CA_FS_NA * 2.0f))) { return 0u; }
+    out->i0_nA = i0;
+
+    /* ---- 3. R, C ---- */
+    out->r_total_ohm = (CA_VSTEP_MV / out->i_inf_nA) * 1.0e6f;
+    out->rs_ohm      = (CA_VSTEP_MV / i0)            * 1.0e6f;
+    out->r1_ohm      = out->r_total_ohm - out->rs_ohm;      /* Rct */
+    if (out->r1_ohm < 1.0f) { return 0u; }
+
+    rpar        = (out->rs_ohm * out->r1_ohm) / out->r_total_ohm;   /* Rs ∥ Rct */
+    out->c1_F   = out->tau_sec[0] / rpar;                           /* Cdl */
+
+    return 1u;
+}
+
+/* ==========================================================================
+ * Z(ω) — 등가회로 가정 없이 라플라스로
+ *
+ *   전압 스텝 ΔV·u(t) →  Z(jω) = ΔV / (jω·I(jω))
+ *
+ *   Y ≡ jω·I(jω)
+ *   Y_real = I∞ + Σ A_k · (ωτ_k)² / [1+(ωτ_k)²]
+ *   Y_imag =      Σ A_k · (ωτ_k)  / [1+(ωτ_k)²]
+ *   Z_real =  ΔV·Y_real / |Y|² × 1e6
+ *   Z_imag = −ΔV·Y_imag / |Y|² × 1e6
+ *
+ *   지수 개수에 무관. ω→0 에서 R_total, ω→∞ 에서 Rs (극한 일치 확인).
+ *   Randles 식과 0.1Hz 에서 대조 검증 완료 (23015/−17842 vs 23006/−17864 Ω).
+ *   expf/logf 불필요 — 곱셈 + sqrtf + atan2f 각 1회.
+ * ========================================================================== */
+uint8_t max30123_z_from_fit(const ca_fit_t *f, float freq_hz, impedance_result_t *out)
+{
+    float   w, yr, yi, d, zr, zi, wt, wt2;
+    uint8_t k;
+
+    if ((f == NULL) || (out == NULL) || (freq_hz <= 0.0f)) { return 0u; }
+    if ((f->n_exp == 0u) || (f->n_exp > CA_NEXP_MAX))      { return 0u; }
+
+    w  = 6.28318531f * freq_hz;
+    yr = f->i_inf_nA;
+    yi = 0.0f;
+
+    for (k = 0u; k < f->n_exp; k++) {
+        if (f->tau_sec[k] <= 0.0f) { continue; }
+        wt  = w * f->tau_sec[k];
+        wt2 = wt * wt;
+        d   = 1.0f + wt2;
+        yr += f->a_nA[k] * (wt2 / d);
+        yi += f->a_nA[k] * (wt  / d);
+    }
+
+    d = (yr * yr) + (yi * yi);                      /* |Y|² [nA²] */
+    if (d < 1e-6f) { return 0u; }
+
+    zr =  (CA_VSTEP_MV * yr / d) * 1.0e6f;          /* mV/nA × 1e6 = Ω */
+    zi = -(CA_VSTEP_MV * yi / d) * 1.0e6f;
+
+    out->z_real      = (int32_t)zr;
+    out->z_imag      = (int32_t)zi;
+    out->z_mag       = (int32_t)sqrtf((zr * zr) + (zi * zi));
+    out->z_phase_deg = (int32_t)(atan2f(zi, zr) * 57.29578f);
+
+    return 1u;
+}
+
+/* 행별 유효 대역 안에서 Z 주파수 3점을 고른다.
+ *   f_max ≈ 1/(2π·ISP),  f_min ≈ 1/(2π·T),  T = 100·ISP → 대역비 100 */
+void ca_z_freqs(float isp_sec, float *f)
+{
+    float fmax = 1.0f / (6.28318531f * isp_sec);
+    f[0] = fmax / 50.0f;
+    f[1] = fmax / 10.0f;
+    f[2] = fmax /  2.0f;
+}
+
+/* ==========================================================================
+ * 한 세트(STEP 100개) 완성 시 처리
+ * ========================================================================== */
+void ca_on_set_complete(void)
+{
+    float         fz[CA_Z_FREQ_COUNT];
+    float         tau_p;
+    uint8_t       i, fit_ok;
+    chron_A_sps_e want;
+
+    ca_acc.rate     = ca_active_idx;
+    ca_acc.isp_sec  = ca_active_cfg->isp_sec;
+    ca_acc.conv_sec = ca_active_cfg->conv_sec;
+
+    ca_set_done = 1u;           /* ★ 모든 경로에서 세운다. 이게 없어서
+                                 *   case 1 이 영원히 플래그를 못 봤다 */
+
+    /* ISP 변경 직후 첫 세트는 깨져 있을 수 있으므로 폐기 */
+    if (ca_range_state == CA_RANGE_SETTLING) {
+        ca_range_state = (ca_active_idx == (uint8_t)CA_PROBE_ROW)
+                       ? CA_RANGE_PROBE : CA_RANGE_LOCKED;
+        ca_acc.n_step   = 0u;
+        ca_result_valid = 0u;
+        return;
+    }
+
+    fit_ok = max30123_step_fit(&ca_acc, &ca_fit);
+
+    /* ---- 프로브 : I∞ 없이 τ 추정 → 다음 행 결정 ---- */
+    if (ca_range_state == CA_RANGE_PROBE) {
+        tau_p = ca_probe_tau(&ca_acc);
+        if ((tau_p == 0.0f) && (fit_ok != 0u)) {
+            tau_p = ca_fit.tau_sec[0];              /* τ 가 작다 → 이 버스트가 유효 */
+        }
+        want = ca_row_for_tau(tau_p);
+
+#if _MAX30123_INFO_DEBUG_
+        swmLogInfo("[CA] probe tau=" LOG_FLOAT_MARKER "s -> row %u (cur %u)\r\n",
+                   LOG_FLOAT(tau_p), (unsigned)want, (unsigned)ca_active_idx);
+#endif
+        if ((uint8_t)want != ca_active_idx) {
+            max30123_chrono_A_count = want;         /* 레지스터는 case 0 에서 */
+            ca_range_state  = CA_RANGE_LOCKED;
+            ca_result_valid = 0u;
+            ca_acc.n_step   = 0u;
+            return;
+        }
+        ca_range_state = CA_RANGE_LOCKED;           /* 프로브 행이 이미 맞다 */
+    }
+
+    /* ---- 피팅 실패 → 다음 회차엔 프로브부터 ---- */
+    if (fit_ok == 0u) {
+        memset(impedance_result, 0, sizeof(impedance_result));
+        ca_result_valid         = 0u;
+        ca_acc.n_step           = 0u;
+        max30123_chrono_A_count = CA_PROBE_ROW;
+        ca_range_state          = CA_RANGE_PROBE;
+#if _MAX30123_INFO_DEBUG_
+        swmLogInfo("[CA] fit reject -> reprobe\r\n");
+#endif
+        return;
+    }
+
+    /* ---- τ 가 창을 벗어났으면 행 이동 후 재측정 ---- */
+    if ((ca_fit.tau_sec[0] < (ca_acc.isp_sec *  5.0f)) ||
+        (ca_fit.tau_sec[0] > (ca_acc.isp_sec * 10.0f))) {
+        want = ca_row_for_tau(ca_fit.tau_sec[0]);
+        if ((uint8_t)want != ca_active_idx) {
+            max30123_chrono_A_count = want;
+            ca_result_valid = 0u;
+            ca_acc.n_step   = 0u;
+            return;
+        }
+    }
+
+    /* ---- 유효 결과 ---- */
+    ca_z_freqs(ca_acc.isp_sec, fz);
+    for (i = 0u; i < CA_Z_FREQ_COUNT; i++) {
+        max30123_z_from_fit(&ca_fit, fz[i], &impedance_result[i]);
+    }
+    ca_result_valid = 1u;
+
+#if _IMPEDANCE_RESULT_DEBUG_
+    swmLogInfo("[CA] row=%u I0=" LOG_FLOAT_MARKER " Iinf=" LOG_FLOAT_MARKER
+               " tau=" LOG_FLOAT_MARKER "\r\n",
+               (unsigned)ca_acc.rate, LOG_FLOAT(ca_fit.i0_nA),
+               LOG_FLOAT(ca_fit.i_inf_nA), LOG_FLOAT(ca_fit.tau_sec[0]));
+    max30123_delay_ms(1u);
+    swmLogInfo("[CA] Rs=" LOG_FLOAT_MARKER "k Rct=" LOG_FLOAT_MARKER
+               "k Rt=" LOG_FLOAT_MARKER "k Cdl=" LOG_FLOAT_MARKER "uF\r\n",
+               LOG_FLOAT(ca_fit.rs_ohm      * 0.001f),
+               LOG_FLOAT(ca_fit.r1_ohm      * 0.001f),
+               LOG_FLOAT(ca_fit.r_total_ohm * 0.001f),
+               LOG_FLOAT(ca_fit.c1_F * 1.0e6f));
+    max30123_delay_ms(1u);
+    for (i = 0u; i < CA_Z_FREQ_COUNT; i++) {
+        swmLogInfo("[Z] f=" LOG_FLOAT_MARKER "Hz Zr=%ld Zi=%ld |Z|=%ld ph=%ld\r\n",
+                   LOG_FLOAT(fz[i]),
+                   (long)impedance_result[i].z_real, (long)impedance_result[i].z_imag,
+                   (long)impedance_result[i].z_mag,  (long)impedance_result[i].z_phase_deg);
+        max30123_delay_ms(1u);
+    }
+#endif
+
+    ca_acc.n_step = 0u;
+}
+
+/* ==========================================================================
+ * FIFO 드레인 — 블로킹 없음. 글루코스와 impedance 를 태그로 분류한다.
+ *
+ *  이 함수 하나가 기존 manual/auto 측정 함수 4개를 대체한다.
+ *  MCU 는 자기 주기(BLE 깨우기)에 이것만 호출하고 다시 잔다.
+ * ========================================================================== */
+void max30123_fifo_drain(void)
+{
+    uint8_t  buf[2], ovf;
+    uint16_t cnt, i;
+    float    we;
+
+    if (ca_active_cfg == NULL) { return; }      /* cfg_apply() 전에 호출됨 */
+
+    spidrv_read_max30123_reg_buffer(MAX30123_REG_FIFO_COUNTER1, buf, 2);
+    ovf = (uint8_t)(buf[0] & 0x7Fu);
+    cnt = (uint16_t)(((uint16_t)(buf[0] & 0x80u) << 1) | buf[1]);
+
+    /* 유실이 있으면 누적기의 위상이 어긋나 이후 모든 fit 이 두 버스트의 혼합이 된다.
+     * OVF 는 FIFO_COUNTER1 하위 7비트에 같이 오므로 SPI 추가 비용이 0. */
+    if (ovf != 0u) {
+#if _MAX30123_INFO_DEBUG_
+        swmLogInfo("[CA] FIFO OVF=%u → discard\r\n", (unsigned)ovf);
+#endif
+        ca_acc.n_step = 0u;
+        max30123_fifo_flush();
+
+        return;
+    }
+
+    if (cnt == 0u) { return; }                  /* 바로 복귀 → sleep */
+    if (cnt > MAX30123_FIFO_DEPTH) { cnt = MAX30123_FIFO_DEPTH; }
+
+    for (i = 0u; i < cnt; i++) {
+        if (max30123_read_fifo_data(&max30123_fifo) == 0) { break; }
+
+        /* ---- M0 : 글루코스(PSTAT) ---- */
+        if (max30123_fifo.meas_id == CA_MEAS_M0) {
+            if (max30123_fifo.data_type == FIFO_TYPE_WE1_PSTAT_CURR) {
+                /* chrono 직후 N개는 전극 교란 때문에 버린다.
+                 * 카운트만 줄이고 push 하면 의미가 없으므로 여기서 걸러낸다 */
+                if (max30123_chrono_A_wait_count > 0u) {
+                    max30123_chrono_A_wait_count--;
+                } else {
+                    we = dc_code_to_nA(max30123_fifo.adc_val);
+                    rb_push(&ring_buff, we, we);
+#if _EIS_FIFO_INFO_DEBUG_
+                    swmLogInfo("[DC] " LOG_FLOAT_MARKER " nA\r\n", LOG_FLOAT(we));
+#endif
+            }
+            continue;
+        }
+
+        /* ---- M1 : Chrono A STEP ---- */
+        if (max30123_fifo.meas_id != CA_MEAS_M1)               { continue; }
+        if (max30123_fifo.data_type != FIFO_TYPE_WE1_STEP)     { continue; }
+
+        if (ca_acc.n_step < CA_STEP_COUNT) {
+            ca_acc.step_nA[ca_acc.n_step] = ca_code_to_nA(max30123_fifo.adc_val);
+            ca_acc.n_step++;
+        }
+
+        if (ca_acc.n_step >= CA_STEP_N) {
+            ca_on_set_complete();
+            break;                  /* ★ flush 된 FIFO 를 더 읽지 않는다 */
+        }
+    }
+}
+
+
+/* ---- [C8] 글루코스 발행 ------------------------------------------------- */
+static void ca_dc_publish(void)
+{
+    if (calendar.update != DATE_TIME_UPDATE_SUCCESS) { return; }
+
+    if (ring_buff.count >= CA_DC_AVG_N) {
+        rb_flush_trimmed_average(&ring_buff,
+                                 &device_info.we1_current,
+                                 &device_info.we2_current);
+        append_Potentiostat_data();
+        max30123_send_attribute(APP_ATTR_SEND_AGMS_VALUE);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////
+//
+//	max30123
+//
+
+/**************************************************************************************
+ * MAX30123 단계별 진행 상태..
+ **************************************************************************************/
+void max30123_measure_Process(void)
+{
+	float we_current;
+	uint16_t cal = 0u;
+
+	if(read_custom_irq()!=1)
+		return;
+
+	clear_custom_irq();
+
+	switch(max30123_measure_step) {
+		case MAX30123_STEP_CALIBRATION:
+			if(max30123_measure_calibration(&cal)) {					// 보정이 되어야 다음 단계로 넘어 간다...
+				max30123_measure_step = MAX30123_STEP_DC_CURRENT;
+			}
+			break;
+
+		case MAX30123_STEP_DC_CURRENT:
+			if(max30123_measure_DC_manual_mode(&we_current)) {
+				if(calendar.update == DATE_TIME_UPDATE_SUCCESS) {
+					if(max30123_chrono_A_wait_count>0)	max30123_chrono_A_wait_count--;
+					if(max30123_chrono_A_wait_count==0) {	// chrono_A 측정 이후 FIFO 안정화를 위해 6번 데이터를 버린다...10초 --> 6회 ==> 60초
+						rb_push(&ring_buff, we_current, we_current);
+
+#if _EIS_FIFO_INFO_DEBUG_
+    swmLogInfo("DC_CURRENT : ("LOG_FLOAT_MARKER")nA, [%.2f]nA, [%d]\r\n", LOG_FLOAT(we_current), we_current, ring_buff.count);
+#endif
+
+						if(ring_buff.count >= 6) {			// 10초 간격으로
+							rb_flush_trimmed_average(&ring_buff, &device_info.we1_current, &device_info.we2_current);
+							append_Potentiostat_data();
+
+							max30123_send_attribute(APP_ATTR_SEND_AGMS_VALUE);
+						}
+					}
+				}
+			}
+			break;
+
+		case MAX30123_STEP_CHRONO_A:
+			max30123_measure_ChronoAmperometry();
+			break;
+
+		default:
+			break;
+	}
+}
+
+/***********************************************************************************************************************
+ *  MAX30123 CA (ChronoAmperometry)
+ ***********************************************************************************************************************/
+void max30123_measure_ChronoAmperometry(void)
+{
+	switch(max30123_chrono_A_step) {
+/* ---- 0 : SPS 적용 + M1 enable ---- */
+		case 0:
+			max30123_M1_chrono_A_sps((chron_A_sps_e)max30123_chrono_A_count);
+
+			ca_range_state = (max30123_chrono_A_count == (uint8_t)CA_PROBE_ROW) ? CA_RANGE_PROBE : CA_RANGE_LOCKED;
+			ca_acc.n_step   = 0u;
+	        ca_set_done     = 0u;               /* ★ [B] */
+			ca_result_valid = 0u;
+
+			max30123_fifo_flush();
+
+			spidrv_write_max30123_reg_action(MAX30123_REG_M1_CFG, CA_M1_CFG_ON);
+			ca_seq_restart();
+
+			ca_wait_s     = 0u;
+			ca_deadline_s = (uint16_t)(CA_TSSP_SEC
+						  + ((ca_active_cfg->duration_ms + 999u) / 1000u)
+						  + CA_WAIT_MARGIN_SEC);
+
+#if _MAX30123_INFO_DEBUG_
+		swmLogInfo("[CA] arm row=%u deadline=%us\r\n",
+				   (unsigned)ca_target_row, (unsigned)ca_deadline_s);
+#endif
+		        max30123_chrono_A_step = 1u;
+		        Call_Custom_NTF_Timeout(CA_POLL_SEC);
+		       break;
+
+/* ---- 1 : STEP 100개 모이기 대기 ---- */
+		case 1:
+	        max30123_fifo_drain();              /* 완성되면 내부에서 ca_on_set_complete() */
+
+	        if (ca_set_done != 0u) {            /* ★ [B] n_step==0 이 아니라 플래그로 */
+	            max30123_chrono_A_step = 2u;
+	            Call_Custom_NTF_Timeout(1u);
+	            break;
+	        }
+
+	        if (ca_acc.n_step == 0u) {          /* 세트 처리 완료 (성공이든 재측정이든) */
+	            max30123_chrono_A_step = 2u;
+	            Call_Custom_NTF_Timeout(1u);
+	            break;
+	        }
+
+	        ca_wait_s = (uint16_t)(ca_wait_s + CA_POLL_SEC);
+	        if (ca_wait_s >= ca_deadline_s) {
+	#if _MAX30123_INFO_DEBUG_
+	            swmLogInfo("[CA] timeout n_step=%u/%u (%us)\r\n",
+	                       (unsigned)ca_acc.n_step, (unsigned)CA_STEP_N,
+	                       (unsigned)ca_wait_s);
+	#endif
+	            ca_result_valid = 0u;
+	            max30123_chrono_A_step = 2u;
+	            Call_Custom_NTF_Timeout(1u);
+	            break;
+	        }
+	        Call_Custom_NTF_Timeout(CA_POLL_SEC);
+			break;
+
+		case 2:
+	        spidrv_write_max30123_reg_action(MAX30123_REG_M1_CFG, CA_M1_CFG_OFF);
+	        ca_acc.n_step = 0u;
+
+	        if (ca_result_valid != 0u) {
+	            impedance_calendar.epoch = get_epoch_time(&calendar);
+	            max30123_send_attribute(APP_ATTR_SEND_AGMS_VALUE);
+	            ca_retry = 0u;
+	            max30123_chrono_A_step = 3u;
+	            Call_Custom_NTF_Timeout(1u);
+	            break;
+	        }
+
+	        /* 레인지가 바뀌었거나 실패 → 전극 이완 후 재측정 */
+	        if (ca_retry < CA_RETRY_MAX) {
+	            ca_retry++;
+	#if _MAX30123_INFO_DEBUG_
+	            swmLogInfo("[CA] retry %u/%u row=%u\r\n",
+	                       (unsigned)ca_retry, (unsigned)CA_RETRY_MAX,
+	                       (unsigned)ca_target_row);
+	#endif
+	            max30123_chrono_A_step = 0u;
+	            Call_Custom_NTF_Timeout(CA_RELAX_SEC);
+	            break;
+	        }
+
+	        ca_retry = 0u;
+	        max30123_chrono_A_step = 3u;
+	        Call_Custom_NTF_Timeout(1u);
+
+			break;
+
+		case 3:																		//
+	        /* chrono 스텝이 전극을 교란하므로 직후 PSTAT 몇 개를 버린다 */
+	        max30123_chrono_A_wait_count = CA_DC_DISCARD_N;
+	        max30123_chrono_A_step       = 0u;
+	        max30123_measure_step        = MAX30123_STEP_DC_CURRENT;
+	        Call_Custom_NTF_Timeout(1u);
+			break;
+
+		default:
+	        spidrv_write_max30123_reg_action(MAX30123_REG_M1_CFG, CA_M1_CFG_OFF);
+	        max30123_chrono_A_step = 0u;
+			break;
+	}
+}
+
+/************************************************************************************************************
+ * CHRONOAMPEROMETRY FREQUENCE
+ ************************************************************************************************************/
+void max30123_M1_chrono_A_sps(chron_A_sps_e idx)
+{
+    const chrono_A_cfg_t *c;
+
+    if ((uint8_t)idx >= (uint8_t)CHRONO_SPS_COUNT) { return; }
+    c = &chrono_A_cfg[idx];
+
+    spidrv_write_max30123_reg_action(MAX30123_REG_CHRONO_CLK_DIV_MSB,
+                                     (uint8_t)((c->chrono_clk_div >> 8) & 0xFFu));
+
+    spidrv_write_max30123_reg_action(MAX30123_REG_CHRONO_CLK_DIV_LSB,
+                                     (uint8_t)( c->chrono_clk_div       & 0xFFu));
+
+	spidrv_write_max30123_reg_action(MAX30123_REG_CHRONO_A_CFG1, CA_CFG1_VALUE); 	// PRE=4, POST_PULSE=0, AUTO_SUBTRACT=1, DELAY=24.8µs
+	spidrv_write_max30123_reg_action(MAX30123_REG_CHRONO_A_CFG2, CA_STEP_SMP_REG);
+	spidrv_write_max30123_reg_action(MAX30123_REG_CHRONO_A_CFG3, 0x00u);          	// REC    = 0
+	spidrv_write_max30123_reg_action(MAX30123_REG_CHRONO_A_CFG4, 0x00u);          	// BLANK  = 1 ISP
+	spidrv_write_max30123_reg_action(MAX30123_REG_CHRONO_A_CFG5, 0x00u);          	// REPEAT = 1회
+    spidrv_write_max30123_reg_action(MAX30123_REG_CHRONO_A_CFG6, CA_CHRONO_A_CFG6);  /* FS 1024nA */
+
+    spidrv_write_max30123_reg_action(MAX30123_REG_M1_CONV, c->m1_conv);
+    spidrv_write_max30123_reg_action(MAX30123_REG_M1_AVG,  MEAS_AVE_1);
+
+	ca_active_cfg = c;
+	ca_active_idx = idx;
+
+    /* ISP 변경이 버스트 중간에 들어가면 그 버스트가 깨진다.
+     * FIFO 를 비우고 다음 한 세트를 폐기한다. */
+    ca_acc.n_step = 0u;
+    ca_range_state = CA_RANGE_SETTLING;
+
+    max30123_fifo_flush();
+
+
+#if _MAX30123_INFO_DEBUG_
+    swmLogInfo("[CA] row=%u ISP=" LOG_FLOAT_MARKER "ms conv=%02X T=%lums\r\n",
+               (unsigned)idx, LOG_FLOAT(c->isp_sec * 1000.0f),
+               (unsigned)c->m1_conv, (unsigned long)c->duration_ms);
+#endif
+}
+
+
+
+
+/************************************************************************************************************
+ * CHRONOAMPEROMETRY TASK...1minute
+ ************************************************************************************************************/
+void max30123_M1_chrono_A_Timeout_Task(void)
+{
+#ifdef SWMTRACE_OUTPUT
+	swmLogInfo("max30123_M1_chrono_A_Timeout_Task!!! : [%d] \r\n", max30123_chrono_A_measure_tmout);
+#endif
+	max30123_chrono_A_measure_tmout++;
+	max30123_chrono_A_measure_tmout%=CHRONO_A_MEASURE_TIME;
+	if(!max30123_chrono_A_measure_tmout) {
+		max30123_measure_step = MAX30123_STEP_CHRONO_A;
+		max30123_chrono_A_step= 0;
+
+#ifdef SWMTRACE_OUTPUT
+	swmLogInfo("MAX30123_STEP_CHRONO_A START \r\n");
+#endif
+
+	}
+}

@@ -3,7 +3,7 @@
  * @brief Message Handler source file
  *
  * @copyright @parblock
- * Copyright (c) 2024 Semiconductor Components Industries, LLC (d/b/a
+ * Copyright (c) 2025 Semiconductor Components Industries, LLC (d/b/a
  * onsemi), All Rights Reserved
  *
  * This code is the property of onsemi and may not be redistributed
@@ -19,10 +19,7 @@
 #include <app.h>
 #include "app_customss.h"
 /* Application headers */
-#include "app_temperature_sensor.h"
 
-//#define APP_DEV_VER                  "V320R"
-#define APP_DEV_NAME                 "AGMS_I10-2_%s_%02X%02X"
 
 
 #if 0
@@ -45,9 +42,6 @@ static generic_func_pointer service_init_queue[APP_MAX_PROF_SVC_COUNT] = {0};
 #endif
 
 
-static uint8_t	ParamUpdateCmd=0;			// 2024.05.10
-static uint8_t	customss_Notify_Time=0;		// 2024.05.10
-
 volatile uint32_t adv_start_reset_time = 0;
 volatile uint32_t param_update_time = 0;
 
@@ -63,11 +57,6 @@ cust_svc_desc app_cust_svc_db[APP_NUM_CUST_SVC];
 uint16_t app_disc_svc_count[APP_MAX_NB_CON];
 
 GAPM_ActivityStatus_t advActivityStatus;
-
-//connection_interval_time_t	connection_interval_time;
-
-
-int con_param_update_attempt=0;
 
 extern conn_param_info_t conn_param_info[APP_MAX_NB_CON];
 
@@ -170,10 +159,6 @@ const union gapc_dev_info_val* getDevInfoCfm[] =
     [GAPC_DEV_SLV_PREF_PARAMS] = &getDevInfoCfmSlvParams
 };
 
-
-
-
-
 static void SetConnectionCfmParams(uint8_t conidx, struct gapc_connection_cfm* cfm);
 
 static uint8_t total_service_index = 0;
@@ -192,8 +177,8 @@ static void App_BLE_CUSSAddToDatabaseCS1(void)
 static void App_BLE_ServiceInitQueue(void)
 {
     service_init_queue[APP_STD_PRF_INDEX] = (generic_func_pointer)BASS_ProfileTaskAddCmd;
-    service_init_queue[APP_CUS_SVC0_INDEX] = (generic_func_pointer)App_BLE_CUSSAddToDatabaseCS0;
-
+    service_init_queue[APP_CUS_SVC0_INDEX] = (generic_func_pointer)
+                                             App_BLE_CUSSAddToDatabaseCS0;
 #if CEM102_DIAG_FUNCTIONS
     service_init_queue[APP_CUS_SVC1_INDEX] = (generic_func_pointer)
                                              App_BLE_CUSSAddToDatabaseCS1;
@@ -212,7 +197,6 @@ static void App_BLE_AddNextService(void)
             App_BLE_ServiceInitQueue();
             svc_initialized = true;
         }
-
         if (total_service_index < APP_MAX_PROF_SVC_COUNT)
         {
 #ifdef SWMTRACE_OUTPUT
@@ -273,37 +257,33 @@ void BLE_ConfigHandler(ke_msg_id_t const msg_id, void const *param,
                     Device_BLE_Param_Get(PARAM_ID_BD_ADDRESS, &ble_dev_addr_len, ble_dev_addr_buf);
 
                     ble_dev_addr_code = ble_dev_addr_buf[1] + ble_dev_addr_buf[0];
+#if 0                    
                     if(ble_dev_addr_code>0xFF)
                     	rsl15_info->device_code =  (uint8_t)(ble_dev_addr_code-0xFF);
                     else
                     	rsl15_info->device_code =  (uint8_t)(ble_dev_addr_code);
+#endif
 
 
 #ifdef SWMTRACE_OUTPUT
                     swmLogInfo("    Device BLE public address read: ");
-#endif
                     for (int i = 0; i < GAP_BD_ADDR_LEN; i++)
                     {
-#ifdef SWMTRACE_OUTPUT
                         swmLogInfo("0x%02x ", ble_dev_addr_buf[i]);
-#endif
                     }
-#ifdef SWMTRACE_OUTPUT
                     swmLogInfo("\r\n");
-                    swmLogInfo("    devConfigCmd address set to public : [%d]\r\n", rsl15_info->device_code);
+                    swmLogInfo("    devConfigCmd address set to public : [%02x]\r\n", ble_dev_addr_code);
 #endif
-                    memcpy(devConfigCmd.addr.addr, ble_dev_addr_buf, GAP_BD_ADDR_LEN);
+                    memcpy(devConfigCmd.addr.addr, ble_dev_addr_buf,
+                           sizeof(devConfigCmd.addr.addr));
 
-
-                    // add sodykim
                     memset(device_name, 0, APP_DEVICE_NAME_LEN+1);
-//                	snprintf((char *)device_name, APP_DEVICE_NAME_LEN + 1, APP_DEV_NAME, APP_DEV_VER, ble_dev_addr_buf[1], ble_dev_addr_buf[0]);
+#if 1
+                	snprintf((char *)device_name, APP_DEVICE_NAME_LEN + 1, APP_DEV_NAME, APP_DEV_VER, ble_dev_addr_buf[1], ble_dev_addr_buf[0]);
+#else
                 	snprintf((char *)device_name, APP_DEVICE_NAME_LEN + 1, APP_DEV_NAME, APP_DEV_VER_BUFF, ble_dev_addr_buf[1], ble_dev_addr_buf[0]);
-
-
-
+#endif
                 }
-
                 PrepareAdvScanData();			// add sodykim for advertising
 
                 /* Send a device configuration request to the BLE stack.
@@ -331,7 +311,6 @@ void BLE_ConfigHandler(ke_msg_id_t const msg_id, void const *param,
 #ifdef SWMTRACE_OUTPUT
             swmLogInfo("__GAPM_PROFILE_ADDED_IND - profile added count=%d\r\n",
                        GAPM_GetProfileAddedCount());
-
             swmLogInfo("    BLE profile BASS added successfully...\r\n");
 #endif
             /* Request the stack to add our custom service server to the attribute database.
@@ -396,6 +375,7 @@ void BLE_ActivityHandler(ke_msg_id_t const msg_id, void const *param,
                     app_adv_data_len, app_adv_data);
             GAPM_SetAdvDataCmd(GAPM_SET_ADV_DATA, advActivityStatus.actv_idx,
                     app_adv_data_len, app_adv_data);
+            APP_SetMeasureTimerEvent(cem102_dut, MEAS_TIMER_OK_TO_RUN_BLE);
         }
         break;
 
@@ -468,7 +448,6 @@ void BLE_ConnectionHandler(ke_msg_id_t const msg_id, void const *param,
                 APP_SendConCfm(conidx);
             }
 
-#if 0
             /* Update connection parameter information to be used for
              * parameter update request */
             conn_param_info[conidx].con_interval = p->con_interval;
@@ -480,27 +459,20 @@ void BLE_ConnectionHandler(ke_msg_id_t const msg_id, void const *param,
             {
                 Scheduler_Set_TaskState(APP_CONN_PARAM_UDPATE_TASK_NUM, TASK_BLOCKED);
             }
-#else
 
-			ParamUpdateCmd = API_TRUE;
-			ke_timer_set(APP_CUSS_PARAM_UPDATE_REQ, TASK_APP, TIMER_SETTING_S(BLE_PARAM_UPDATE_TIME));
-
-			if(rsl15_info->date_time_update!=DATE_TIME_UPDATE_SUCCESS) {										// RTC Time Initial...o?? ???? ?? ?? 1??? ????...???? ??u..
-				ke_timer_set(APP_CUSS_AGMS_REQ_DATE_TIME, KE_BUILD_ID(TASK_APP, conidx),TIMER_SETTING_S(3));	// 3sec ??
-			}
-
-
-
-#if 0
-			if(!customss_Notify_Time) {
-				customss_Notify_Time = API_TRUE;
-
-				CUSTOMSS_NotifyOnTimeout(TIMER_SETTING_S(10));
-	            swmLogInfo("CUSTOMSS_NotifyOnTimeout = %d\r\n", customss_Notify_Time);
-			}
+// update의 경우 초기 1회 확인용으로 모든 정보는 이 이후 진행을 한다
+// resync의 경우 같은 앱인지 확인용으로 모든 정보는 정상적으로 처리 되지만 데이터만 전송을 보류 한다.
+            if((calendar.update != CALENDAR_UPDATE_SUCCESS) || (calendar.resync != CALENDAR_UPDATE_SUCCESS)) {
+#ifdef SWMTRACE_OUTPUT
+		swmLogInfo("calendar : [%d] / [%d]!!! \r\n", calendar.update, calendar.resync);
 #endif
+        		app_env_cs0.cem102_agms_to_air_cccd_value[conidx] = ATT_CCC_START_NTF;
+				cs0_attr_to_send = APP_ATTR_READ_CALENDAR;
+				CUSTOMSS_AGMS_Start_Timer(conidx, TIMER_SETTING_S(3));
 
-#endif
+				device_info.auth_count = 0;
+				enable_Authentication_Task();
+            }
         }
         break;
 
@@ -534,13 +506,9 @@ void BLE_ConnectionHandler(ke_msg_id_t const msg_id, void const *param,
                 GAPM_AdvActivityStart(advActivityStatus.actv_idx, 0, 0);
             }
 
-#if 0
             /* Stop BASS */
             disable_BASS_Tasks();
-#endif
 
-
-#if 0
             /* If there is no connection currently and connection parameter request task
              * has been running, suspend it.
              */
@@ -549,14 +517,15 @@ void BLE_ConnectionHandler(ke_msg_id_t const msg_id, void const *param,
             {
                 Scheduler_Set_TaskState(APP_CONN_PARAM_UDPATE_TASK_NUM, TASK_SUSPENDED);
             }
-#endif
 
+            calendar.resync = CALENDAR_UPDATE_NONE;
+            device_info.auth_count = 0;
+            disable_Authentication_Task();
 
 #ifdef SWMTRACE_OUTPUT
             swmLogInfo("__GAPC_DISCONNECT_IND: reason = %d\r\n",
                     ((struct gapc_disconnect_ind*)param)->reason);
 #endif
-
 
         }
         break;
@@ -619,7 +588,6 @@ void BLE_ConnectionHandler(ke_msg_id_t const msg_id, void const *param,
             swmLogInfo("  gapc_param_updated_ind->sup_to = %d\r\n", p->sup_to);
 #endif
 
-#if 0
             /* Update connection parameter for connection parameter update task */
             conn_param_info[conidx].con_interval = p->con_interval;
             conn_param_info[conidx].update_attempt = 0;
@@ -631,35 +599,6 @@ void BLE_ConnectionHandler(ke_msg_id_t const msg_id, void const *param,
             {
                 Scheduler_Set_TaskState(APP_CONN_PARAM_UDPATE_TASK_NUM, TASK_BLOCKED);
             }
-#else
-
-/**********************************************************************************************************************
- *	Default Minimum & Maximum Connection Interval from master device side
- **********************************************************************************************************************/
-            if ((p->con_interval > MASTER_DEF_MIN_CONN_INT && p->con_interval < MASTER_DEF_MAX_CONN_INT) && (con_param_update_attempt < MAX_CON_PARAM_UPDATE_ATTEMPT))
-            {
-#if 0
-            	GAPC_ParamUpdateCmd(conidx, MIN_CONNECTION_INTERVAL, MAX_CONNECTION_INTERVAL,
-                                    SLAVE_LATENCY, CONNECTION_SUPERVISION_TIMEOUT,
-                                    MIN_CONNECTION_EVENT_DURATION, MAX_CONNECTION_EVENT_DURATION);
-#else
-				ke_timer_set(APP_CUSS_PARAM_UPDATE_REQ, TASK_APP, TIMER_SETTING_S(BLE_PARAM_UPDATE_TIME));			// 2sec interval
-#endif
-				swmLogInfo("con_param_update_attempt : %d \r\n", con_param_update_attempt);
-                con_param_update_attempt++;
-            }
-
-/****************************************************************************************************************************************
-  *	connection parameter update confirm..2024.05.09
-  *	if connection interval time & latency is equal, close parameter update time.
-  ****************************************************************************************************************************************/
-			if((ParamUpdateCmd==API_TRUE)&&(p->con_interval==conn_interval_time.intv_min)&&(p->con_latency==conn_interval_time.latency)) {
-				ParamUpdateCmd=API_FALSE;
-
-				ke_timer_clear(APP_CUSS_PARAM_UPDATE_REQ, TASK_APP);
-				swmLogInfo("APP_CUSS_PARAM_UPDATE_REQ CLEAR!!!!\r\n");
-            } 
-#endif
         }
         break;
     }
@@ -770,24 +709,26 @@ void BLE_PairingHandler(ke_msg_id_t const msg_id, void const *param,
 
                 case GAPC_IRK_EXCH:
                 {
+                    union gapc_bond_cfm_data irkExch = {0};
+                    memcpy(irkExch.irk.addr.addr.addr, GAPM_GetDeviceConfig()->addr.addr,
+                           sizeof(irkExch.irk.addr.addr.addr));
+                    irkExch.irk.addr.addr_type = GAPM_GetDeviceConfig()->privacy_cfg;
+                    memcpy(irkExch.irk.irk.key, GAPM_GetDeviceConfig()->irk.key,
+                           sizeof(irkExch.irk.irk.key));
+                    GAPC_BondCfm(conidx, GAPC_IRK_EXCH, true, &irkExch); /* Send confirmation */
 #ifdef SWMTRACE_OUTPUT
                     swmLogInfo("__GAPC_BOND_REQ_IND / GAPC_IRK_EXCH\rn");
 #endif
-                    union gapc_bond_cfm_data irkExch = {0};
-                    memcpy(irkExch.irk.addr.addr.addr, GAPM_GetDeviceConfig()->addr.addr, GAP_BD_ADDR_LEN);
-                    irkExch.irk.addr.addr_type = GAPM_GetDeviceConfig()->privacy_cfg;
-                    memcpy(irkExch.irk.irk.key, GAPM_GetDeviceConfig()->irk.key, GAP_KEY_LEN);
-                    GAPC_BondCfm(conidx, GAPC_IRK_EXCH, true, &irkExch); /* Send confirmation */
                 }
                 break;
 
                 case GAPC_CSRK_EXCH:
                 {
+                    union gapc_bond_cfm_data csrkExch = {0};
+                    GAPC_BondCfm(conidx, GAPC_CSRK_EXCH, true, &csrkExch); /* Send confirmation */
 #ifdef SWMTRACE_OUTPUT
                     swmLogInfo("__GAPC_BOND_REQ_IND / GAPC_CSRK_EXCH\r\n");
 #endif
-                    union gapc_bond_cfm_data csrkExch = {0};
-                    GAPC_BondCfm(conidx, GAPC_CSRK_EXCH, true, &csrkExch); /* Send confirmation */
                 }
                 break;
             }
@@ -808,7 +749,7 @@ void BLE_PairingHandler(ke_msg_id_t const msg_id, void const *param,
                     GAPC_AddRecordToBondList(conidx); /* STEP 15 */
                     swmLogInfo("__GAPC_BOND_IND: index=%d, used bonds=%d, max=%d\r\n",
                         (int)conidx,
-                        BondList_Size(),
+                        (int)BondList_Size(),
                         BONDLIST_MAX_SIZE
                     );
                 }
@@ -833,10 +774,10 @@ void BLE_PairingHandler(ke_msg_id_t const msg_id, void const *param,
                 bool found = (GAPC_IsBonded(conidx) &&
                               (p->ediv == p_bondinfo->ediv) &&
                               !memcmp(p->rand_nb.nb, p_bondinfo->rand, GAP_RAND_NB_LEN));
+                GAPC_EncryptCfm(conidx, found, p_bondinfo->ltk, GAP_KEY_LEN);
 #ifdef SWMTRACE_OUTPUT
                 swmLogInfo("__GAPC_ENCRYPT_REQ_IND: bond information %s\r\n", (found ? "FOUND" : "NOT FOUND"));
 #endif
-                GAPC_EncryptCfm(conidx, found, p_bondinfo->ltk, GAP_KEY_LEN);
             }
         }
         break;
@@ -867,7 +808,7 @@ static void SetConnectionCfmParams(uint8_t conidx, struct gapc_connection_cfm *c
     if ((GAPC_IsBonded(conidx)) && (p_bondinfo != NULL))
     {
         cfm->ltk_present = true;
-        memcpy(cfm->rcsrk.key, p_bondinfo->csrk, KEY_LEN);
+        memcpy(cfm->rcsrk.key, p_bondinfo->csrk, sizeof(cfm->rcsrk.key));
         cfm->lsign_counter = 0xFFFFFFFF;
         cfm->rsign_counter = 0;
         cfm->pairing_lvl = p_bondinfo->pairing_lvl;
@@ -913,19 +854,19 @@ void APP_SendConCfm(uint8_t conidx)
 
     /* Get Task IDs for each added profile/s */
     uint16_t added_profile_task_id[APP_MAX_NB_PROFILES];
-    memcpy(added_profile_task_id, GAP_GetProfileAddedTaskId(), APP_MAX_NB_PROFILES);
+    memcpy(added_profile_task_id, GAP_GetProfileAddedTaskId(),
+           sizeof(added_profile_task_id));
 
     /* Enable standard profile services using task IDs */
     for (uint8_t i = 0; i < APP_MAX_NB_PROFILES; i++)
     {
         if (added_profile_task_id[i] == TASK_ID_BASS)
         {
-
-#if 0    		// sodykim delete ...because UXN not use Schedule Task
             /* Enable BASS */
             BASS_EnableReq(conidx);
             enable_BASS_Tasks();
-#endif
+
+            enable_Temperature_Task();			// add sodykim 26.08.10
         }
     }
 
@@ -942,78 +883,21 @@ void APP_SendConCfm(uint8_t conidx)
     }
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////
-//
-//	BELOW USER SETTING
-//
 
-/*
-  * @brief Prepare and send GAPC_PARAM_UPDATE_CMD to perform an update on parameters
-  *
-  * Prepare and send GAPC_PARAM_UPDATE_CMD to perform an update of connection parameters.
-  *
-  * @param [in] conidx     Connection identifier
-  * @param [in] intv_min   Minimum of connection interval (value = intv_max * 1.25 ms)
-  * @param [in] intv_max   Maximum of connection interval (value = intv_max * 1.25 ms)
-  * @param [in] time_out   Link supervision timeout (value = time_out * 10 ms)
-  * @param [in] latency    connection latency (connSupervisionTimeout / (connIntervalMax * 2))-1))
-  * @param [in] ce_len_min Minimum CE length (value = ce_len_min * 0.625 ms)
-  * @param [in] ce_len_max Maximum CE length (value = ce_len_min * 0.625 ms)
-*/
-
-
-/***********************************************************************************************************************************************************************************
-  *
-  *		CONNECTION ??? ?????????? ?????? ???? ??? ???...
-  *
-  ***********************************************************************************************************************************************************************************/
-
-void ParamUpdateHandler(ke_msg_id_t const msg_id, void const *param, ke_task_id_t const dest_id, ke_task_id_t const src_id)
+/**************************************************************************************
+ *	명령을 보내고 일정 시간 동안 응답이 오지 않을 경우 강제 종료 한다... 시간 요청
+ **************************************************************************************/
+void Authentication_Certify_Task(void)
 {
-    uint8_t connectionCount;
-	uint8_t conidx;
-
-	connectionCount = GAPC_ConnectionCount();
-	conidx = KE_IDX_GET(dest_id);
-
-
-#ifdef SWMTRACE_OUTPUT
-		swmTrace_printf("ParamUpdateHandler : [%d][%d]\r\n", conidx, connectionCount);
+#ifdef SWMTRACE_DEBUG
+	swmLogInfo("Authentication_Certify_Task : [%d] \r\n", device_info.auth_count);
 #endif
 
+	device_info.auth_count++;
+	if(device_info.auth_count > 3) {
+		GAPC_DisconnectAll(CO_ERROR_REMOTE_USER_TERM_CON);				// 3초 간격으로 3회 이상 오류가 발생을 하면 강제 종료 한다.
 
-/* Process the event that triggered the handler */
-	switch (msg_id)		{
-	/* Event: a service has been added to the database, start notifications */
-		case APP_CUSS_PARAM_UPDATE_REQ:
-			if(connectionCount>0) {
-
-				if(progress_time_condition(param_update_time, 2)) {								// duplication..minimum 2 second command interval time
-					param_update_time = Sys_RTC_Value_Seconds();
-
-#ifdef SWMTRACE_OUTPUT
-					swmTrace_printf("APP_CUSS_PARAM_UPDATE_REQ : [%d][%d][%d][%d]\r\n", conidx, connectionCount, src_id, dest_id);
-#endif
-					GAPC_ParamUpdateCmd(conidx, conn_interval_time.intv_min, conn_interval_time.intv_max, conn_interval_time.latency, conn_interval_time.sv_tmout, 0xFFFF, 0xFFFF);
-				}
-
-				ParamUpdateCmd = API_TRUE;
-				ke_timer_set(APP_CUSS_PARAM_UPDATE_REQ, TASK_APP, TIMER_SETTING_S(BLE_PARAM_UPDATE_TIME+3));			// 3sec interval
-			}
-
-			else {
-				ParamUpdateCmd = API_TRUE;
-				ke_timer_set(APP_CUSS_PARAM_UPDATE_REQ, TASK_APP, TIMER_SETTING_S(BLE_PARAM_UPDATE_TIME+3));			// 3sec interval
-			}
-
-		break;
-
-		default:
-			break;
+		device_info.auth_count = 0;
+		disable_Authentication_Task();
 	}
 }
-
-
-

@@ -31,30 +31,17 @@ volatile int32_t WE1_voltage = 0;
 volatile int32_t WE2_voltage = 0;
 volatile uint8_t cem102_err_status = 0;
 
-static struct app_env_tag_cs0 app_env_cs0;
+struct app_env_tag_cs0 app_env_cs0;
 #if CEM102_DIAG_FUNCTIONS
 static struct app_env_tag_cs1 app_env_cs1;
 CEM102_DIAG_FUNC_CHAR cem102_diag_func_char;
 #endif /* CEM102_DIAG_FUNCTIONS */
-static uint8_t conidx_saved=0xff;
+
+extern uint8_t agms_payload_buff[LSAD_SEND_SIZE];
+uint8_t cs0_attr_to_send = APP_ATTR_SEND_AGMS_VALUE;
 
 uint8_t custom_irq = 0;
-
-
-volatile uint32_t agme_update_time = 0;
-
-extern int afe_wakeup_step;
-extern int afe_wakeup_time;
-
-extern uint8_t max30123_measure_step;
-extern uint8_t max30123_chronoamperometry;
-extern uint8_t max30123_chrono_A_wait_count;
-extern uint32_t customss_NTF_tmout;
-
-
-#define CHRONO_A_TIMEOUT			60
-
-void CUSTOMSS_NTF_Event_Handle(ke_task_id_t const conidx);
+uint8_t custom_conidx = 255;
 
 
 static const struct att_db_desc att_db_cs_svc0[] =
@@ -62,41 +49,6 @@ static const struct att_db_desc att_db_cs_svc0[] =
     /**** Service 0 ****/
     CS_SERVICE_UUID_128(CS0_SERVICE, CS0_SVC_UUID),
 
-
-	/* CEM102 agms send data to serve */
-	CS_CHAR_UUID_128(CS0_AGMS_SEND_VALUE_CHAR0,
-		CS0_AGMS_SEND_VALUE_VAL0,
-		CS0_CHAR_AGMS_SEND_UUID,
-		(PERM(RD, ENABLE) | PERM(NTF, ENABLE)),
-		sizeof(app_env_cs0.agms_to_air_buffer),
-		app_env_cs0.agms_to_air_buffer, NULL),
-
-	CS_CHAR_CCC(CS0_AGMS_SEND_VALUE_CCC0,
-		app_env_cs0.agms_to_air_buffer, NULL),
-
-	CS_CHAR_USER_DESC(CS0_AGMS_SEND_VALUE_USR_DSCP0,
-		sizeof(CS0_AGMS_SEND_CHAR_NAME) - 1,
-		CS0_AGMS_SEND_CHAR_NAME, NULL),
-
-		/* CEM102 agms read data to serve */
-	CS_CHAR_UUID_128(CS0_AGMS_READ_VALUE_CHAR0,                  	/* Characteristic's ID (attidx_char) */
-		CS0_AGMS_READ_VALUE_VAL0,                   										/* Characteristic's Value ID (attidx_val) */
-		CS0_CHAR_AGMS_READ_UUID,                        									/* Characteristic's UUID */
-		CS0_TX_PERMISSIONS,                      									/* Characteristic's Permissions */
-		sizeof(app_env_cs0.agms_to_air_buffer),   							/* Characteristic's Data Length */
-		app_env_cs0.agms_to_air_buffer,           									/* Pointer to Characteristic's Data */
-		App_BLE_CUSSReadWriteRequestCallback    				/* Pointer to Callback Function */
-	),
-
-	CS_CHAR_CCC(CS0_AGMS_READ_VALUE_CCC0,                   				/* CCC's ID */
-			app_env_cs0.agms_to_air_buffer, NULL),     	 						/* Pointer to CCC's Data */
-
-	CS_CHAR_USER_DESC(CS0_AGMS_READ_VALUE_USR_DSCP0,   				     /* User Description's ID */
-			sizeof(CS0_AGMS_READ_CHAR_NAME) - 1,            			/* User Description's Length */
-			CS0_AGMS_READ_CHAR_NAME,  NULL),                      			/* Pointer to Description String */
-
-
-#if 0
     /* CEM102 battery data to serve */
     CS_CHAR_UUID_128(CS0_VBAT_CEM102_VALUE_CHAR0,
                      CS0_VBAT_CEM102_VALUE_VAL0,
@@ -155,7 +107,36 @@ static const struct att_db_desc att_db_cs_svc0[] =
                     sizeof(CS0_CEM102_ERR_CHAR_NAME) - 1,
                     CS0_CEM102_ERR_CHAR_NAME,
                     NULL),
-#endif
+
+	/* agms의 경우 TX & RX UUID를 각각 주고 한다. */
+	CS_CHAR_UUID_128(CS0_AGMS_SEND_VALUE_CHAR0,	CS0_AGMS_SEND_VALUE_VAL0,
+					CS0_CHAR_AGMS_SEND_UUID,
+					(PERM(RD, ENABLE) | PERM(NTF, ENABLE)),
+					sizeof(app_env_cs0.cem102_agms_to_air_buffer),
+					app_env_cs0.cem102_agms_to_air_buffer, NULL),
+	CS_CHAR_CCC(CS0_AGMS_SEND_VALUE_CCC0,
+				app_env_cs0.cem102_agms_to_air_buffer,
+				NULL),
+	CS_CHAR_USER_DESC(CS0_AGMS_SEND_VALUE_USR_DSCP0,
+					sizeof(CS0_AGMS_SEND_CHAR_NAME) - 1,
+					CS0_AGMS_SEND_CHAR_NAME,
+					NULL),
+
+			/* CEM102 agms read data to serve */
+	CS_CHAR_UUID_128(CS0_AGMS_READ_VALUE_CHAR0,	CS0_AGMS_READ_VALUE_VAL0,
+					CS0_CHAR_AGMS_READ_UUID,
+					CS0_TX_PERMISSIONS,
+					sizeof(app_env_cs0.cem102_agms_to_air_buffer),
+					app_env_cs0.cem102_agms_to_air_buffer,
+					CUSSTOMSS_CS0_Callback),
+	CS_CHAR_CCC(CS0_AGMS_READ_VALUE_CCC0,
+			app_env_cs0.cem102_agms_to_air_buffer, NULL),
+
+	CS_CHAR_USER_DESC(CS0_AGMS_READ_VALUE_USR_DSCP0,
+					sizeof(CS0_AGMS_READ_CHAR_NAME) - 1,
+					CS0_AGMS_READ_CHAR_NAME,
+					NULL),
+
 
 #if APP_MEASURE_ACROSS_IO_INPUTS
     /* Temperature data to serve */
@@ -200,7 +181,6 @@ static const struct att_db_desc att_db_cs_svc0[] =
                      CS0_WE2_VOLT_CHAR_NAME,
                      NULL),
 #endif /* APP_MEASURE_ACROSS_IO_INPUTS */
-
 };
 
 #if CEM102_DIAG_FUNCTIONS
@@ -393,20 +373,34 @@ static const struct att_db_desc att_db_cs_svc1[] =
 };
 #endif /* CEM102_DIAG_FUNCTIONS */
 
+#if 0
+/* CEM102 AGMS DATA SEND Data Characteristic in Service 3 */
+CS3_AGMS_SEND_VALUE_CHAR0,
+CS3_AGMS_SEND_VALUE_VAL0,
+CS3_AGMS_SEND_VALUE_CCC0,
+CS3_AGMS_SEND_VALUE_USR_DSCP0,
+
+/* CEM102 AGMS DATA REND Data Characteristic in Service 3 */
+CS3_AGMS_READ_VALUE_CHAR0,
+CS3_AGMS_READ_VALUE_VAL0,
+CS3_AGMS_READ_VALUE_CCC0,
+CS3_AGMS_READ_VALUE_USR_DSCP0,
+#endif
+
 static uint32_t notifyOnTimeout;
 
 const struct att_db_desc * CUSTOMSS_GetDatabaseDescription(uint8_t att_db_cs_svc_id)
 {
 #if CEM102_DIAG_FUNCTIONS
-	if (CUST_SVC1 == att_db_cs_svc_id)
-	{
-		return att_db_cs_svc1;
-	}
-	else /* CUST_SVC0 */
+        if (CUST_SVC1 == att_db_cs_svc_id)
+        {
+            return att_db_cs_svc1;
+        }
+        else /* CUST_SVC0 */
 #endif /* CEM102_DIAG_FUNCTIONS */
-	{
-		return att_db_cs_svc0;
-	}
+        {
+            return att_db_cs_svc0;
+        }
 }
 
 static int CUSTOMSS_SendAttribute(uint8_t conidx, uint8_t attr_to_send)
@@ -417,26 +411,16 @@ static int CUSTOMSS_SendAttribute(uint8_t conidx, uint8_t attr_to_send)
     uint16_t handle = 0;
     int result = ATTR_NOT_FOUND;
 
+#ifdef SWMTRACE_DEBUG
+	swmLogInfo("CUSTOMSS_SendAttribute : [%d] \r\n", attr_to_send);
+    Sys_Delay(APP_SYS_DELAY_1MS);
+#endif
+
     switch (attr_to_send)
     {
-    	case APP_ATTR_SEND_AGMS_VALUE:
-    	{
-            if (app_env_cs0.agms_to_air_cccd_value[conidx] == ATT_CCC_START_NTF)
-            {
-                app_env_cs0.agms_to_air_buffer[0] = 0xA0;
-                app_env_cs0.agms_to_air_buffer[1] = 0xBF;
-
-                length = CS0_AGMS_MAX_LENGTH;
-                length = 4;
-                p_data = app_env_cs0.agms_to_air_buffer;
-            }
-
-    	}
-    	break;
-
         case APP_ATTR_SEND_VBAT_VALUE:
         {
-            if (app_env_cs0.vbat_to_air_cccd_value[conidx] == ATT_CCC_START_NTF)
+        	if (app_env_cs0.vbat_to_air_cccd_value[conidx] == ATT_CCC_START_NTF)
             {
                 app_env_cs0.vbat_to_air_buffer[0] = (uint8_t)((cem102_vbat >> 0) & 0xFF);
                 app_env_cs0.vbat_to_air_buffer[1] = (uint8_t)((cem102_vbat >> 8) & 0xFF);
@@ -450,7 +434,7 @@ static int CUSTOMSS_SendAttribute(uint8_t conidx, uint8_t attr_to_send)
 
         case APP_ATTR_SEND_WE1_CURRENT:
         {
-            if (app_env_cs0.we1_curr_to_air_cccd_value[conidx] == ATT_CCC_START_NTF)
+        	if (app_env_cs0.we1_curr_to_air_cccd_value[conidx] == ATT_CCC_START_NTF)
             {
                 app_env_cs0.we1_curr_to_air_buffer[0] = (uint8_t)((WE1_current >> 0) & 0xFF);
                 app_env_cs0.we1_curr_to_air_buffer[1] = (uint8_t)((WE1_current >> 8) & 0xFF);
@@ -492,6 +476,55 @@ static int CUSTOMSS_SendAttribute(uint8_t conidx, uint8_t attr_to_send)
             }
         }
         break;
+
+/**************************************************************************************************************
+ * BELOW UXN AGMS CALENDAR & DATA & TIME
+ **************************************************************************************************************/
+        case APP_ATTR_SEND_AGMS_VALUE:
+            if (app_env_cs0.cem102_agms_to_air_cccd_value[conidx] == ATT_CCC_START_NTF)
+            {
+                if(calendar.update == CALENDAR_UPDATE_SUCCESS) {
+					if(agms_batch.batch_ramain == 0) {
+						attr_id = CS0_AGMS_SEND_VALUE_VAL0;
+						if(device_info.agms_mode == AGMS_MODE_CHRONO_A)
+							length = agms_send_impedance_info_packet(CHRONO_A_INFO_COMMAND);
+						else
+							length = agms_send_payload_packet();
+
+						p_data = (uint8_t *)agms_payload_buff;
+					}
+                }
+            }
+        	break;
+
+        case APP_ATTR_SEND_AGMS_CONTINUEOUS:
+            if (app_env_cs0.cem102_agms_to_air_cccd_value[conidx] == ATT_CCC_START_NTF)
+            {
+#ifdef SWMTRACE_DEBUG
+				swmLogInfo("APP_ATTR_SEND_AGMS_CONTINUEOUS \r\n");
+#endif
+				attr_id = CS0_AGMS_SEND_VALUE_VAL0;
+				length = agms_send_payload_packet();
+				p_data = (uint8_t *)agms_payload_buff;
+            }
+        	break;
+
+        case APP_ATTR_READ_CALENDAR:
+            if (app_env_cs0.cem102_agms_to_air_cccd_value[conidx] == ATT_CCC_START_NTF)
+            {
+                if((calendar.update != CALENDAR_UPDATE_SUCCESS) || (calendar.resync != CALENDAR_UPDATE_SUCCESS)) {
+					attr_id = CS0_AGMS_SEND_VALUE_VAL0;
+					length = agms_read_current_calendar(READ_UNIX_TIME_COMMAND);
+					p_data = (uint8_t *)agms_payload_buff;
+
+					CUSTOMSS_AGMS_Start_Timer(conidx, TIMER_SETTING_S(3));
+                }
+            }
+        	break;
+
+        case APP_ATTR_CUSS_MAX30123:
+        	break;
+
 
 #if APP_MEASURE_ACROSS_IO_INPUTS
         case APP_ATTR_SEND_TEMPERATURE:
@@ -855,8 +888,6 @@ static int CUSTOMSS_SendAttribute(uint8_t conidx, uint8_t attr_to_send)
     {
         GATTC_SendEvtCmd(conidx, GATTC_NOTIFY, attr_to_send,
                          handle, length, p_data);
-
-
         if (APP_ATTR_SEND_ERROR_CODE == attr_to_send)
         {
             /* Clear cem102 error status */
@@ -878,29 +909,16 @@ uint8_t CUSSTOMSS_CS0_Callback(uint8_t conidx, uint16_t attidx,
     /* Instruct the abstraction layer to send a confirmation message */
     *cfm_msg_instr = CFM_MSG_INSTR_TO_SEND;
 
+//	swmLogInfo("CUSSTOMSS_CS0_Callback : %d\r\n", attidx);
+
+
     /* Check that there are no high-layer errors */
     if (hl_status == GAP_ERR_NO_ERROR)
     {
         /* Process the attribute that this read/write callback relates to */
         switch (attidx)
         {
-			case CS0_AGMS_READ_VALUE_CCC0:
-			{
-				/* Copy the data into the destination buffer
-  				 * CCCD variables are of type uint16_t */
-				if (operation == GATTC_WRITE_REQ_IND)
-				{
-					app_env_cs0.agms_to_air_cccd_value[conidx] = *src_buffer;
-
-#ifdef SWMTRACE_OUTPUT
-            swmLogInfo("CUSSTOMSS_CS0_Callback (%d).[%02x]\r\n", attidx, src_buffer[0]);
-#endif /* SWMTRACE_OUTPUT */
-
-				}
-				break;
-			}
-
-        	case CS0_VBAT_CEM102_VALUE_CCC0:
+            case CS0_VBAT_CEM102_VALUE_CCC0:
             {
                 /* Copy the data into the destination buffer
                  * CCCD variables are of type uint16_t */
@@ -943,6 +961,14 @@ uint8_t CUSSTOMSS_CS0_Callback(uint8_t conidx, uint16_t attidx,
                 }
                 break;
             }
+//---------------------------------------------------------------------------------------------------------------------------------------
+            case CS0_AGMS_READ_VALUE_VAL0:
+            	swmLogInfo("CS0_AGMS_READ_VALUE_VAL0 : [%d], [%02X][%02X][%02X][%02X]\r\n", length,
+            			src_buffer[0], src_buffer[1], src_buffer[2], src_buffer[3]);
+
+            	agms_callback_msg_event(conidx, src_buffer);
+            	break;
+
 #if APP_MEASURE_ACROSS_IO_INPUTS
             case CS0_TEMP_VALUE_CCC0:
             {
@@ -1145,12 +1171,14 @@ uint8_t CUSSTOMSS_CS1_Callback(uint8_t conidx, uint16_t attidx,
 }
 #endif
 
+
 static void CUSTOMSS_NTF_Timer(void)
 {
-    uint8_t conidx = 0;
-    int result = ATTR_NOT_FOUND;
+//    uint8_t conidx = 0;
+//    int result = ATTR_NOT_FOUND;
 
-    int index = APP_ATTR_SEND_FIRST + 1;
+#if 0
+    int index = APP_ATTR_SEND_AGMS_VALUE;
 
     /* Search for the first attritute with the notification enabled
      *  and send the notification */
@@ -1163,8 +1191,18 @@ static void CUSTOMSS_NTF_Timer(void)
             index = APP_ATTR_SEND_FIRST + 1;
         }
     }
+#else
+//    result = CUSTOMSS_SendAttribute(conidx, APP_ATTR_SEND_AGMS_VALUE);
+
+#endif
 
     CUSTOMSS_StartTimer();
+
+#ifdef SWMTRACE_OUTPUT
+		swmLogInfo("CUSTOMSS_NTF_Timer!!! \r\n");
+#endif
+
+
 }
 
 static void CUSTOMSS_Init_Service0(void)
@@ -1176,13 +1214,11 @@ static void CUSTOMSS_Init_Service0(void)
      * client devices. */
     for (uint8_t i = 0; i < APP_MAX_NB_CON; i++)
     {
-        app_env_cs0.agms_to_air_cccd_value[i] = ATT_CCC_START_NTF;
-
         app_env_cs0.vbat_to_air_cccd_value[i] = ATT_CCC_STOP_NTFIND;
         app_env_cs0.we1_curr_to_air_cccd_value[i] = ATT_CCC_STOP_NTFIND;
         app_env_cs0.we2_curr_to_air_cccd_value[i] = ATT_CCC_STOP_NTFIND;
         app_env_cs0.cem102_err_to_air_cccd_value[i] = ATT_CCC_STOP_NTFIND;
-
+        app_env_cs0.cem102_agms_to_air_cccd_value[i] = ATT_CCC_STOP_NTFIND;
 
 #if APP_MEASURE_ACROSS_IO_INPUTS
         app_env_cs0.temp_to_air_cccd_value[i] = ATT_CCC_STOP_NTFIND;
@@ -1231,30 +1267,22 @@ void CUSTOMSS_Initialize(void)
     CUSTOMSS_Init_Service1();
 #endif /* CEM102_DIAG_FUNCTIONS */
 
-    CUSTOMSS_NotifyOnTimeout(TIMER_SETTING_S(10));		// sodykim
+    CUSTOMSS_NotifyOnTimeout(TIMER_SETTING_S(10));
 
     MsgHandler_Add(CUSTOMSS_NTF_TIMEOUT, CUSTOMSS_MsgHandler);
     MsgHandler_Add(GATTC_CMP_EVT, CUSTOMSS_MsgHandler);
     MsgHandler_Add(GAPC_DISCONNECT_IND, CUSTOMSS_MsgHandler);
-    
-//---------------------------------------------------------------------------------------------
-//	ADD to CUSTOMSS_MsgHandler
-//---------------------------------------------------------------------------------------------
-	MsgHandler_Add(APP_CUSS_AGMS_REQ_DATE_TIME, CUSTOMSS_MsgHandler);
-	MsgHandler_Add(APP_CUSS_AGMS_NEXT_SEND_DATA, CUSTOMSS_MsgHandler);
+    if (APP_MeasurementTimerEnabled())
+    {
+        MsgHandler_Add(CEM102_MEASUREMENT_START_TIMEOUT, CUSTOMSS_MsgHandler);
+    }
 
-	MsgHandler_Add(APP_CUSS_CHRONO_A_TIMEOUT, CUSTOMSS_MsgHandler);
-
-//	MsgHandler_Add(APP_CUSS_AFE_WAKEUP_TIMEOUT, CUSTOMSS_MsgHandler);
-}
-
-#if 0
-void CUSTOMSS_AFE_Wakeup_Timeout(void)
-{
-    ke_timer_set(APP_CUSS_AFE_WAKEUP_TIMEOUT, TASK_APP, TIMER_SETTING_S(10));
+//----------------------------------------------------------------------------------------------------------
+//	AGMS
+//----------------------------------------------------------------------------------------------------------
+    MsgHandler_Add(CUSTOMSS_AGMS_TIMEOUT, CUSTOMSS_MsgHandler);
 
 }
-#endif
 
 void CUSTOMSS_Notify_Now(void)
 {
@@ -1273,7 +1301,6 @@ void Call_Custom_NTF_Timeout(uint32_t timeout)
 	ke_timer_set(CUSTOMSS_NTF_TIMEOUT, TASK_APP, TIMER_SETTING_S(timeout));
 }
 
-
 /* CUSTOM Service Server specific, but generic function so that other modules
  * can use. That's why, timeout and CUSTOMSS_NTF_TIMEOUT are not exposed to
  * the caller.
@@ -1287,6 +1314,20 @@ void CUSTOMSS_StartTimer(void)
     }
 }
 
+
+
+void CUSTOMSS_AGMS_Start_Timer(uint8_t conidx, uint32_t notifyOnTimeout)
+{
+	ke_timer_set(CUSTOMSS_AGMS_TIMEOUT, KE_BUILD_ID(TASK_APP, conidx), notifyOnTimeout);
+}
+
+void CUSTOMSS_AGMS_Clear_Time(uint8_t conidx)
+{
+    ke_timer_clear(CUSTOMSS_AGMS_TIMEOUT, KE_BUILD_ID(TASK_APP, conidx));
+}
+
+
+
 void CUSTOMSS_NotifyOnTimeout(uint32_t timeout)
 {
     notifyOnTimeout = timeout;
@@ -1297,100 +1338,39 @@ void CUSTOMSS_MsgHandler(ke_msg_id_t const msg_id, void const *param,
 {
     uint8_t conidx = KE_IDX_GET(src_id);
 
+    if(custom_conidx != conidx)
+        custom_conidx = conidx;
+
+
     switch (msg_id)
     {
         case CUSTOMSS_NTF_TIMEOUT:
         {
-#if 0
-			CUSTOMSS_NTF_Timer();
-#else
-		    if (conidx_saved != conidx) {
-		        conidx_saved = conidx;
-
-				ke_timer_set(APP_CUSS_CHRONO_A_TIMEOUT, KE_BUILD_ID(TASK_APP, conidx),TIMER_SETTING_S(CHRONO_A_TIMEOUT));
-		    }
-
-#if 0
-			if(rsl15_info->date_time_update == DATE_TIME_UPDATE_SUCCESS) {
-//				LSAD_measure_sensor_level();												// read to battery & temperature...rtc time sync
-				append_lsad_lvl_payload();												// add_Queue Buffer
-
-				if ((app_env_cs0.agms_to_air_cccd_value[0] == ATT_CCC_START_NTF)
-						&& GAPC_IsConnectionActive(conidx))
-				{
-					agms_send_payload_packet(conidx);
-				}
-			}
+#ifdef SWMTRACE_OUTPUT
+		swmLogInfo("CUSTOMSS_NTF_TIMEOUT!!! \r\n");
 #endif
-
-#if 0
-			swmLogInfo("CUSTOMSS_NTF_TIMEOUT : %ld\r\n", (Sys_RTC_Value_Seconds() - customss_NTF_tmout));
-			customss_NTF_tmout = Sys_RTC_Value_Seconds();
-#endif
-
-
 			custom_irq = 1;
-			CUSTOMSS_StartTimer();
 
-			LSAD_measure_sensor_level();				// 온도 측정을 위해...
-#endif
+            CUSTOMSS_NTF_Timer();
         }
         break;
 
-/**************************************************************************************************************
- * BELOW TO UXN...
- **************************************************************************************************************/
-        case APP_CUSS_AGMS_REQ_DATE_TIME:
+        case CEM102_MEASUREMENT_START_TIMEOUT:
+        {
+            CEM102_MeasurementTimerHandler();
+        }
+        break;
 
-			/* Check if the peer device is connected and can be notified */
-			if ((app_env_cs0.agms_to_air_cccd_value[0] == ATT_CCC_START_NTF)
-					&& GAPC_IsConnectionActive(conidx))
-			{
+        case CUSTOMSS_AGMS_TIMEOUT:
+        {
+#ifdef SWMTRACE_OUTPUT
+		swmLogInfo("CUSTOMSS_AGMS_TIMEOUT!!! \r\n");
+#endif
+			CUSTOMSS_SendAttribute(conidx, cs0_attr_to_send);
+        }
+        break;
 
-				if(rsl15_info->date_time_update!=DATE_TIME_UPDATE_SUCCESS) {
-					agms_request_current_data_time(conidx, REQUEST_RTC_FIRST_STATE);
-					ke_timer_set(APP_CUSS_AGMS_REQ_DATE_TIME, KE_BUILD_ID(TASK_APP, conidx),TIMER_SETTING_S(3));																							// 3sec interval
-
-	#ifdef SWMTRACE_DEBUG
-					swmLogInfo("REQUEST_DATE_TIME_UPDATE!!\r\n");
-	#endif
-				}
-			}
-			break;
-
-		case APP_CUSS_AGMS_NEXT_SEND_DATA:
-
-			/* Check if the peer device is connected and can be notified */
-			if ((app_env_cs0.agms_to_air_cccd_value[0] == ATT_CCC_START_NTF)
-					&& GAPC_IsConnectionActive(conidx))
-			{
-				agms_send_payload_packet(conidx);
-			    CUSTOMSS_StartTimer();						// 연속으로 보내는 경우 CUSTOM TIME시간을 다시 초기화 한다.
-			}
-			break;
-
-//	1분 마다 이벤트가 발생을 한다...1440min is 1day
-		case APP_CUSS_CHRONO_A_TIMEOUT:						// 60초 간격으로 시간을 처리 한다..
-			if((max30123_measure_step == MAX30123_STEP_DC_CURRENT) && (rsl15_info->date_time_update == DATE_TIME_UPDATE_SUCCESS))
-			{
-				max30123_chrono_A_wait_tmout++;
-				if(max30123_chrono_A_wait_tmout > CHRONO_A_START_TIME) {
-					max30123_measure_step = MAX30123_STEP_IMPEDANCE;
-					max30123_chronoamperometry = 0;
-					max30123_chrono_A_wait_tmout = 0;
-				}
-			}
-
-			ke_timer_set(APP_CUSS_CHRONO_A_TIMEOUT, KE_BUILD_ID(TASK_APP, conidx),TIMER_SETTING_S(CHRONO_A_TIMEOUT));
-
-			break;
-
-			default:
-				break;
-
-
-
-#if 0		// del sodykim for
+//	완료 통지 이벤트(command complete event)
         case GATTC_CMP_EVT:
         {
             const struct gattc_cmp_evt *p = param;
@@ -1399,20 +1379,21 @@ void CUSTOMSS_MsgHandler(ke_msg_id_t const msg_id, void const *param,
             {
                 if (p->status == ATT_ERR_NO_ERROR)
                 {
+#if 0	// delete sodykim
                     int index = p->seq_num + 1;
                     int result = ATTR_NOT_FOUND;
 
                     while ((result == ATTR_NOT_FOUND) && (conidx < APP_MAX_NB_CON)
                             && (index < APP_ATTR_SEND_LAST))
                     {
-                        result = CUSTOMSS_SendAttribute(conidx, index++);
+//                        result = CUSTOMSS_SendAttribute(conidx, index++);
 
-                        if (index >= APP_ATTR_SEND_LAST)
-                        {
+                        if (index >= APP_ATTR_SEND_LAST)	{
                             conidx++;
                             index = APP_ATTR_SEND_FIRST + 1;
                         }
                     }
+#endif
                 }
 #ifdef SWMTRACE_OUTPUT
                 else
@@ -1429,128 +1410,16 @@ void CUSTOMSS_MsgHandler(ke_msg_id_t const msg_id, void const *param,
         {
             /* Stop the periodic timer for the inactive connection.
              * APP_SendConCfm will restart the timer. */
+#if 0
             ke_timer_clear(CUSTOMSS_NTF_TIMEOUT,
                            KE_BUILD_ID(TASK_APP, conidx));
+#endif
         }
         break;
-#endif
     }
 }
 
 
-/********************************************************************************
- * CUSTOM NTF MSG HANDLER
- ********************************************************************************/
-void CUSTOMSS_NTF_Event_Handle(ke_task_id_t const conidx)
-{
-    if (conidx_saved != conidx) {
-        conidx_saved = conidx;
-    }
-
-#ifdef SWMTRACE_OUTPUT
-	swmLogInfo("CUSTOMSS_NTF_Event_Handle (%d).(%d)\r\n", conidx, GAPC_IsConnectionActive(conidx));
-#endif /* SWMTRACE_OUTPUT */
-
-
-    CUSTOMSS_StartTimer();
-	LSAD_measure_sensor_level();																// read to battery & temperature...rtc time sync
-
-	if(rsl15_info->date_time_update == DATE_TIME_UPDATE_SUCCESS) {
-
-		append_lsad_lvl_payload();																// add_Queue Buffer
-
-		if ((app_env_cs0.agms_to_air_cccd_value[0] == ATT_CCC_START_NTF)
-				&& GAPC_IsConnectionActive(conidx))
-		{
-			agms_send_payload_packet(conidx);
-		}
-    }
-}
-
-
-/* ----------------------------------------------------------------------------
- * Public Function Definitions
- * ------------------------------------------------------------------------- */
-uint8_t App_BLE_CUSSReadWriteRequestCallback(uint8_t conidx, uint16_t attidx,
-    uint16_t handle, uint8_t *dest_buffer, const uint8_t *src_buffer,
-    uint16_t length, uint16_t operation, uint8_t hl_status,
-    uint8_t *cfm_msg_instr)
-{
-
-	/* Initialize a variable to hold the return value */
-    uint8_t status = hl_status;
-
-    /* Instruct the abstraction layer to send a confirmation message */
-    *cfm_msg_instr = CFM_MSG_INSTR_TO_SEND;
-
-    /* Check that there are no high-layer errors */
-    if (hl_status == GAP_ERR_NO_ERROR)
-    {
-        /* Copy the data into the destination buffer */
-        memcpy(dest_buffer, src_buffer, length);
-
-        /* Process the attribute that this read/write callback relates to */
-        switch (attidx)
-        {
-            /* Read or write request to TX characteristic */
-            case CS0_AGMS_SEND_VALUE_VAL0:
-            {
-                /* Log the received data */
-#ifdef SWMTRACE_DEBUG
-                swmLogInfo("TX R/W Callback (%d):(%d) ", conidx, length);
-#endif
-                break;
-            }
-
-            case CS0_AGMS_READ_VALUE_VAL0:
-            {
-                /* Log the received data */
-#ifdef SWMTRACE_DEBUG
-                swmLogInfo("RX R/W Callback (%d):(%d) ", conidx, length);
-#endif
-
-#if 0
-                for(int i =0;i<length;i++) {
-                    swmLogInfo("[%02X] ", dest_buffer[i]);
-                }
-                swmLogInfo("\r\n");
-#endif
-
-                progress_receive_msg_event(conidx, dest_buffer);
-
-                break;
-            }
-
-
-        }
-
-        /* Update the return status */
-        status = ATT_ERR_NO_ERROR;
-    }
-    else
-    {
-        /* Log the error code */
-#ifdef SWMTRACE_DEBUG
-        swmLogInfo(
-            "R/W Request Callback (%d); attribute (%d); operation (%d); error (%d)\r\n",
-            conidx, attidx, operation, hl_status
-        );
-#endif
-    }
-
-    return status;
-}
-
-
-void set_agms_conidx(uint8_t conidx)
-{
-	conidx_saved = conidx;
-}
-
-uint8_t get_agms_conidx(void)
-{
-	return conidx_saved;
-}
 
 uint8_t read_custom_irq(void)
 {
@@ -1563,22 +1432,10 @@ void clear_custom_irq(void)
 }
 
 
-
-void app_custom_send_payload_packet(void)
+/*********************************************************************************
+ *	강제 send attribute
+ *********************************************************************************/
+void max30123_send_attribute(uint8_t cs0_attr_to_send)
 {
-	/* Check if the peer device is connected and can be notified */
-	if ((app_env_cs0.agms_to_air_cccd_value[0] == ATT_CCC_START_NTF)
-			&& GAPC_IsConnectionActive(conidx_saved))
-	{
-		if(impedance_calendar.update) {
-	        swmLogInfo("send_impedance_info\r\n");
-			agms_send_impedance_info_packet(conidx_saved, EIS_INFO_COMMAND);				// EIS INFO
-
-		} else {
-			if(max30123_chrono_A_wait_count==0) {
-				swmLogInfo("send_payload_info\r\n");
-				agms_send_payload_packet(conidx_saved);
-			}
-		}
-	}
+	CUSTOMSS_SendAttribute(custom_conidx, cs0_attr_to_send);
 }

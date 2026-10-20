@@ -21,7 +21,7 @@
 #include "app_customss.h"
 #include "app_button.h"
 
-uint32_t trim_error;
+uint32_t cem102_demo_trim_error;
 
 #ifdef SWMTRACE_OUTPUT
 static uint32_t traceOptions[] = {
@@ -100,7 +100,6 @@ void DeviceInit(void)
      * while loop to make it easier to connect to the debugger.
      * We suggest retaining this feature during development.
      */
-
     SYS_GPIO_CONFIG(DEBUG_CATCH_GPIO, (GPIO_MODE_GPIO_IN | GPIO_LPF_DISABLE |
                                     GPIO_WEAK_PULL_UP  | GPIO_6X_DRIVE));
 
@@ -110,10 +109,10 @@ void DeviceInit(void)
     }
 
     /* Load default trim values. */
-    trim_error = SYS_TRIM_LOAD_DEFAULT();
+    cem102_demo_trim_error = SYS_TRIM_LOAD_DEFAULT();
 
-    if ((trim_error & ERROR_INVALID_CRC) ||
-        (trim_error & ERROR_BG_INVALID))
+    if ((cem102_demo_trim_error & ERROR_INVALID_CRC) ||
+        (cem102_demo_trim_error & ERROR_BG_INVALID))
     {
         while (1)
         {
@@ -148,10 +147,6 @@ void DeviceInit(void)
 
     /* Configure GPIOs */
     App_GPIO_Config();
-
-    /* Load custom trim values */
-    uint32_t custom_trim_error __attribute__((unused)) = SYS_TRIM_LOAD_CUSTOM();
-
 
 #if DEBUG_SLEEP_GPIO == DEBUG_SYSCLK_PWR_MODE
     /* Clear POWER_MODE_GPIO to indicate wakeup */
@@ -207,7 +202,7 @@ void DeviceInit(void)
     RESET->DIG_STATUS = (uint32_t) RESET_DIG_STATUS_CLEAR;
     Sys_ACS_WriteRegister(&ACS->RESET_STATUS, (uint32_t) ACS_RESET_STATUS_CLEAR);
 
-    APP_BASS_ReadBattLevelInit(trim_error);
+    APP_BASS_ReadBattLevelInit(cem102_demo_trim_error);
 
 #ifdef SWMTRACE_OUTPUT
     Init_SWMTrace();
@@ -241,10 +236,6 @@ void AppMsgHandlersInit(void)
     MsgHandler_Add(GAPC_BOND_IND, BLE_PairingHandler);
     MsgHandler_Add(GAPC_ENCRYPT_REQ_IND, BLE_PairingHandler);
     MsgHandler_Add(GAPC_ENCRYPT_IND, BLE_PairingHandler);
-
-    /* UXN   handler */
-    MsgHandler_Add(APP_CUSS_PARAM_UPDATE_REQ, ParamUpdateHandler);
-
 }
 
 void BatteryServiceServerInit(void)
@@ -258,14 +249,13 @@ void BatteryServiceServerInit(void)
     BASS_Initialize(APP_BAS_NB, APP_BASS_ReadBattLevel);
 
     /* Set timeout to 0 so that the kernel timer does not fire */
-//    BASS_NotifyOnBattLevelChange(0);
-//    BASS_NotifyOnTimeout(0);
+    BASS_NotifyOnBattLevelChange(0);
+    BASS_NotifyOnTimeout(0);
 }
 
 void CustomServiceServerInit(void)
 {
     CUSTOMSS_Initialize();
-
 }
 
 void IRQPriorityInit(void)
@@ -360,7 +350,7 @@ void App_Mem_Ret_Sleep_Init(void)
 
     /* Wakeup Configuration */
     mem_retention_sleep_mode_cfg.wakeup_cfg = WAKEUP_DELAY_2                      |
-											  WAKEUP_GPIO1_ENABLE                 |
+                                              WAKEUP_GPIO1_ENABLE                 |
                                               WAKEUP_GPIO1_RISING                 |
                                               WAKEUP_GPIO0_ENABLE                 |
 #if (BUTTON_MANAGER_ENABLED == 1)

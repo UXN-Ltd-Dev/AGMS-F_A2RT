@@ -3,7 +3,7 @@
  * @brief CEM102 diagnostic functionality related source file.
  *
  * @copyright @parblock
- * Copyright (c) 2024 Semiconductor Components Industries, LLC (d/b/a
+ * Copyright (c) 2025 Semiconductor Components Industries, LLC (d/b/a
  * onsemi), All Rights Reserved
  *
  * This code is the property of onsemi and may not be redistributed
@@ -29,6 +29,8 @@ typedef struct
     uint16_t diagreq;
     uint16_t diagreq_saved;
     CEM102_LSAD_STATE lsad_state;
+    uint16_t apireq;
+    CEM102_RegSaveData saved_data;
     CEM102_RegSaveData *p_saved_data;
     uint16_t sample_cnt[MAX_WE_CHANNEL_NUM];
 }CEM102_DiagData;
@@ -61,6 +63,22 @@ static int CEM102_SendCommand(DRIVER_CEM102_t *p_cem102, uint16_t cmd)
 {
     return p_cem102->SystemCommand(cem102_dut,
                                 SYSCTRL_CMD_ALL_ERR_MASK | cmd);
+}
+
+static void CEM102_DisableREDAC(DRIVER_CEM102_t *p_cem102,
+                                const CEM102_Device *p_dev,
+                                uint16_t sw_cfg, uint16_t buf_cfg)
+{
+    uint16_t val = 0;
+
+    /* We want to retain the DAC settings, when disabling */
+    p_cem102->RegisterRead(p_dev, DC_DAC_RE_CTRL, &val);
+
+    val &= DC_DAC_RE_CTRL_DAC_RE_VALUE_MASK;
+    val |= DAC_RE_DISABLE;
+
+    /* Disable RE channel, SR switches, and HP mode, RE_BUFFER */
+    p_cem102->REDACConfig(p_dev, val, sw_cfg, buf_cfg);
 }
 
 static CEM102_DAC_TYPE CEM102_GetChanNumber(CEM102_LSAD_READ_TYPE lsad_req)
@@ -127,6 +145,7 @@ static uint16_t CEM102_GetSysStatusMask(CEM102_LSAD_READ_TYPE lsad_req)
     switch (lsad_req)
     {
         case CEM102_LSAD_READ_WE1:
+        case CEM102_LSAD_READ_RE:   /* LSAD-1 is used for RE DAC */
         {
             mask &= ~(CH2_COMPLETION);
             break;
@@ -144,22 +163,9 @@ static uint16_t CEM102_GetSysStatusMask(CEM102_LSAD_READ_TYPE lsad_req)
     return mask;
 }
 
-/* When dac is passed with RE, it assumes WE1 */
-static void CEM102_GetValueFromBuffer(uint32_t chan, int32_t *p_lsad)
-{
-    uint8_t lower = APP_WE1_LOWER_HALF_WORD;
-    uint8_t upper = APP_WE1_UPPER_HALF_WORD;
-
-    if (WE2 == chan)
-    {
-        lower = APP_WE2_LOWER_HALF_WORD;
-        upper = APP_WE2_UPPER_HALF_WORD;
-    }
-    *p_lsad = (int32_t)(measure_buf[lower] + (measure_buf[upper] << 16));
-}
-
 static void CEM102_ResultDACVoltage(DRIVER_CEM102_t *p_cem102,
-                                    CEM102_CurrentData *p_data)
+                                    CEM102_CurrentData *p_data,
+                                    uint16_t diagmask)
 {
     uint32_t chan = WE1;  /* WE1 for RE */
     CEM102_DAC_TYPE dac = CEM102_GetChanNumber(p_data->lsad_req);
@@ -169,7 +175,14 @@ static void CEM102_ResultDACVoltage(DRIVER_CEM102_t *p_cem102,
         chan = WE2;
     }
     int32_t lsad_val = 0;
-    CEM102_GetValueFromBuffer(chan, &lsad_val);
+
+    const CEM102_Device *p_dev = cem102_dut;
+    p_cem102->RE_ATBusSwitchConfig(p_dev, RE,  0);
+
+    /* Only one LSAD is enabled at any given point of time.
+     * As a result, Pass WE1 to this function all the time.
+     */
+    CEM102_GetValueFromBuffer(WE1, (uint32_t *)&lsad_val);
 
     int32_t v_measured = 0;
     p_cem102->CalculateVoltage(chan, lsad_val, &v_measured);
@@ -190,11 +203,11 @@ static void CEM102_ResultDACVoltage(DRIVER_CEM102_t *p_cem102,
         v_diff = v_measured - v_dac;
     }
 
-    /* Now, v_measured has a difference, not the actual measurement. */
-    if (WE2 == dac)
+    /* Now, v_diff has a difference, not the actual measurement. */
+    if (WE2 == p_data->target_dac)
     {
         cem102_diag_func_char.WE2_DAC_volt = v_diff;
-    } else if (RE == dac)
+    } else if (RE == p_data->target_dac)
     {
         cem102_diag_func_char.RE_DAC_volt = v_diff;
     }
@@ -202,30 +215,33 @@ static void CEM102_ResultDACVoltage(DRIVER_CEM102_t *p_cem102,
     {
         cem102_diag_func_char.WE1_DAC_volt = v_diff;
     }
-#ifdef SWMTRACE_OUTPUT
-    swmLogInfo("DAC-%d: Voltage(uV): dac=%d, measured=%d, Delta %d\r\n", dac,
-               v_dac, v_measured, v_diff);
-#endif /* SWMTRACE_OUTPUT */
+
+    CEM102_DiagResult result;
+    result.dac = p_data->target_dac;
+    result.voltage = v_measured;
+    result.diagmask = diagmask;
+    result.in_diag = (diagData.apireq == 0) ? true : false;
+    APP_NotifyDiagResult(p_cem102, p_dev, &result);
 }
 
 static void CEM102_PrintCurrent(CEM102_CurrentData *p_data, const char *str,
                                 CEM102_DAC_TYPE dac, float curr)
 {
 #ifdef SWMTRACE_OUTPUT
-    swmLogInfo("%s: DAC-%d: %f %s\r\n", str, dac, curr,
+    swmLogInfo("\r%s LSAD%d (%s):, %f\r\n", str, dac,
                (p_data->div_factor == APP_FEMTO_PICO_COV_FACTOR) ? "pA" :
-               ((p_data->div_factor == APP_FEMTO_NANO_COV_FACTOR) ? "nA" :
-              "fA"));
+               ((p_data->div_factor == APP_FEMTO_NANO_COV_FACTOR) ?
+               "nA" : "fA"), curr);
 #endif /* SWMTRACE_OUTPUT */
 }
 
 /* This function returns value in pA */
 static void CEM102_ResultCalculateCurrent(DRIVER_CEM102_t *p_cem102,
                                          CEM102_CurrentData *p_data,
-                                         const char *str,
-                                         float *p_fvalue)
+                                         const char *str, float *p_fvalue,
+                                         uint16_t diagmask)
 {
-    uint8_t chan = WE1;
+    uint32_t chan = WE1;
     CEM102_DAC_TYPE dac = CEM102_GetChanNumber(p_data->lsad_req);
 
     if (WE2 == dac)
@@ -234,9 +250,21 @@ static void CEM102_ResultCalculateCurrent(DRIVER_CEM102_t *p_cem102,
     }
 
     int32_t lsad_val = 0;
-    CEM102_GetValueFromBuffer(chan, &lsad_val);
+
+    /* Only one LSAD is enabled at any given point of time.
+     * As a result, Pass WE1 to this function all the time.
+     */
+    CEM102_GetValueFromBuffer(WE1, (uint32_t *)&lsad_val);
 
     p_cem102->CalculateCurrent(chan, lsad_val, p_fvalue);
+
+    CEM102_DiagResult result;
+    result.curr = *p_fvalue;
+    result.diagmask = diagmask;
+    result.dac = chan;
+    result.in_diag = true;
+    APP_NotifyDiagResult(p_cem102, cem102_dut, &result);
+
     *p_fvalue /= p_data->div_factor;
     CEM102_PrintCurrent(p_data, str, dac, *p_fvalue);
 }
@@ -265,32 +293,52 @@ static int CEM102_CalculateRefCurrent(uint32_t chan, uint32_t lsad_val,
         {
             acc_setting = (float)CEM102_NACC_REF;
         }
-        *p_val = cur_val / (acc_setting / (float)(ACCUM_SAMPLE_CNT_8+1));
+        float sample_cnt = (float)(cem102_dut->accum_sample_calib + 1);
+        *p_val = cur_val / (acc_setting / sample_cnt);
     }
     return result;
 }
 
 static void CEM102_ResultCalibCurrent(DRIVER_CEM102_t *p_cem102,
-                                      CEM102_CurrentData *p_data)
+                                      CEM102_CurrentData *p_data,
+                                      uint16_t diagmask)
 {
+    /* When thermistor measurement is disabled, and apireq has at least
+     * one valid request, calibration current is measured.
+     */
+    if ((diagData.apireq) && (calib_ref_measurement == 0))
+    {
+        APP_SetMeasureTimerEvent(cem102_dut, MEAS_TIMER_OK_TO_RUN_DIAGAPI);
+    }
     CEM102_GetValueFromBuffer(CEM102_REF_MEASUREMENT_CHAN,
-                             (int32_t *)&calib_ref_measurement);
-#ifdef SWMTRACE_OUTPUT
+                             &calib_ref_measurement);
+
     float curr = 0.0;
     CEM102_CalculateRefCurrent(CEM102_REF_MEASUREMENT_CHAN,
                                             calib_ref_measurement,
                                             &curr);
+
+    CEM102_DiagResult result;
+    result.curr = curr;
+    result.diagmask = diagmask;
+    result.dac = CEM102_REF_MEASUREMENT_CHAN;
+    result.in_diag = true;
+    APP_NotifyDiagResult(p_cem102, cem102_dut, &result);
+
+#ifdef SWMTRACE_OUTPUT
     curr /= p_data->div_factor;
-    CEM102_PrintCurrent(p_data, "calib curr", CEM102_REF_MEASUREMENT_CHAN,
+    CEM102_PrintCurrent(p_data, "Measured calibration current", CEM102_REF_MEASUREMENT_CHAN,
                         curr);
 #endif /* SWMTRACE_OUTPUT */
 }
 
 static void CEM102_ResultOffsetCurrent(DRIVER_CEM102_t *p_cem102,
-                                      CEM102_CurrentData *p_data)
+                                      CEM102_CurrentData *p_data,
+                                      uint16_t diagmask)
 {
     float curr = 0.0;
-    CEM102_ResultCalculateCurrent(p_cem102, p_data, "OffsetCur", &curr);
+    CEM102_ResultCalculateCurrent(p_cem102, p_data, "OffsetCur", &curr,
+                                  diagmask);
 
     uint32_t val = App_Utils_ConvertFloatToUInt32(curr);
     if (CEM102_LSAD_READ_WE2 == p_data->lsad_req)
@@ -304,10 +352,12 @@ static void CEM102_ResultOffsetCurrent(DRIVER_CEM102_t *p_cem102,
 }
 
 static void CEM102_ResultATResidualCurrent(DRIVER_CEM102_t *p_cem102,
-                                      CEM102_CurrentData *p_data)
+                                           CEM102_CurrentData *p_data,
+                                           uint16_t diagmask)
 {
     float curr = 0.0;
-    CEM102_ResultCalculateCurrent(p_cem102, p_data, "ATResCurr", &curr);
+    CEM102_ResultCalculateCurrent(p_cem102, p_data, "ATResCurr", &curr,
+                                  diagmask);
 
     uint32_t val = App_Utils_ConvertFloatToUInt32(curr);
     if (CEM102_LSAD_READ_WE2 == p_data->lsad_req)
@@ -321,11 +371,12 @@ static void CEM102_ResultATResidualCurrent(DRIVER_CEM102_t *p_cem102,
 }
 
 static void CEM102_ResultResidualCurrent(DRIVER_CEM102_t *p_cem102,
-                                      CEM102_CurrentData *p_data)
+                                         CEM102_CurrentData *p_data,
+                                         uint16_t diagmask)
 {
     float curr = 0.0;
-    CEM102_ResultCalculateCurrent(p_cem102, p_data, "WEResCurr", &curr);
-
+    CEM102_ResultCalculateCurrent(p_cem102, p_data, "WEResCurr", &curr,
+                                  diagmask);
     uint32_t val = App_Utils_ConvertFloatToUInt32(curr);
     if (CEM102_LSAD_READ_WE2 == p_data->lsad_req)
     {
@@ -338,20 +389,24 @@ static void CEM102_ResultResidualCurrent(DRIVER_CEM102_t *p_cem102,
 }
 
 static void CEM102_ResultREResidualCurrent(DRIVER_CEM102_t *p_cem102,
-                                      CEM102_CurrentData *p_data)
+                                           CEM102_CurrentData *p_data,
+                                           uint16_t diagmask)
 {
     float curr = 0.0;
-    CEM102_ResultCalculateCurrent(p_cem102, p_data, "REResCurr", &curr);
+    CEM102_ResultCalculateCurrent(p_cem102, p_data, "REResCurr", &curr,
+                                  diagmask);
 
     uint32_t val = App_Utils_ConvertFloatToUInt32(curr);
     cem102_diag_func_char.RE_residual_curr = val;
 }
 
 static void CEM102_ResultRECEResidualCurrent(DRIVER_CEM102_t *p_cem102,
-                                      CEM102_CurrentData *p_data)
+                                             CEM102_CurrentData *p_data,
+                                             uint16_t diagmask)
 {
     float curr = 0.0;
-    CEM102_ResultCalculateCurrent(p_cem102, p_data, "RCResCurr", &curr);
+    CEM102_ResultCalculateCurrent(p_cem102, p_data, "RCResCurr", &curr,
+                                  diagmask);
 
     uint32_t val = App_Utils_ConvertFloatToUInt32(curr);
     cem102_diag_func_char.RE_CE_residual_curr = val;
@@ -359,7 +414,7 @@ static void CEM102_ResultRECEResidualCurrent(DRIVER_CEM102_t *p_cem102,
 
 static void CEM102_LSADRestoreState(DRIVER_CEM102_t *p_cem102,
                                     CEM102_CurrentData *p_data,
-                                    uint16_t diagmask)
+                                    uint16_t diagmask, uint16_t *p_req)
 {
     if (diagData.regs_saved)
     {
@@ -368,7 +423,7 @@ static void CEM102_LSADRestoreState(DRIVER_CEM102_t *p_cem102,
 
         if (p_data->result_callback != NULL)
         {
-            p_data->result_callback(p_cem102, p_data);
+            p_data->result_callback(p_cem102, p_data, diagmask);
         }
         /* Restore switch settings. */
         p_cem102->RegisterRestore(cem102_dut, diagData.p_saved_data);
@@ -376,7 +431,7 @@ static void CEM102_LSADRestoreState(DRIVER_CEM102_t *p_cem102,
         CEM102_AdjustADCGain(p_cem102, p_data);
     }
     CEM102_SetLSADState(CEM102_LSAD_STATE_SETUP);
-    diagData.diagreq &= ~diagmask;
+    (*p_req) &= ~diagmask;
 }
 
 static int CEM102_ConfigChannelSwitch(DRIVER_CEM102_t *p_cem102,
@@ -423,24 +478,24 @@ static int CEM102_SwitchConfigResCurr(DRIVER_CEM102_t *p_cem102,
 }
 
 static int CEM102_SetupATResidualCurrent(DRIVER_CEM102_t *p_cem102,
-                                       CEM102_CurrentData *p_data)
+                                         CEM102_CurrentData *p_data)
 {
     /* Disconnect all SAxx switches */
     int result = p_cem102->RegisterWrite(cem102_dut, ANA_SW_CFG2,
-                                   ATBUS_SA1_DISCONNECT);
+                                         ATBUS_SA1_DISCONNECT);
 
     /* Disable RE channel, SR switches, and HP mode, RE_BUFFER */
-    result |= p_cem102->REDACConfig(cem102_dut, DAC_RE_DISABLE,
-                                    CH1_SC109_SC110_CONNECT, RE_BUF_DISABLE);
+    CEM102_DisableREDAC(p_cem102, cem102_dut,
+                        CH1_SC109_SC110_CONNECT, RE_BUF_DISABLE);
 
     /* Disable all ST switches */
     result |= p_cem102->RE_ATBusSwitchConfig(cem102_dut, RE,
                                            ATBUS_BUF_DISABLE);
     if (result == ERRNO_NO_ERROR)
     {
-        uint16_t sw_conn[2] = { CH1_SC113_CONNECT | CH1_SC119_SC120_CONNECT,
-                                CH2_SC213_CONNECT | CH2_SC219_SC220_CONNECT
-                              };
+        uint16_t sw_conn[CEM102_NUM_LSADS] = { CH1_SC113_CONNECT | CH1_SC119_SC120_CONNECT,
+                                               CH2_SC213_CONNECT | CH2_SC219_SC220_CONNECT
+                                             };
         result = CEM102_ConfigChannelSwitch(p_cem102, p_data->lsad_req,
                                            sw_conn);
     }
@@ -455,8 +510,8 @@ static int CEM102_SetupResidualCurrent(DRIVER_CEM102_t *p_cem102,
     if (result != ERRNO_NO_ERROR)
     {
         /* Disable RE channel, SR switches, and HP mode, RE_BUFFER */
-        p_cem102->REDACConfig(cem102_dut, DAC_RE_DISABLE,
-                              CH1_SC109_SC110_CONNECT, RE_BUF_DISABLE);
+        CEM102_DisableREDAC(p_cem102, cem102_dut,
+                            CH1_SC109_SC110_CONNECT, RE_BUF_DISABLE);
     }
     return result;
 }
@@ -479,7 +534,7 @@ static int CEM102_ConfigREResidualCurrent(DRIVER_CEM102_t *p_cem102,
     {
         /* Use existing, calibrated value */
         dac_setting = calib_data.dac_setting[WE2 - INDEX_ADJ_HELPER];
-        p_data->target_mv = WE_DAC_TARGET_MV;
+        p_data->target_mv = RE_DAC_V_USER_SETTING;
     }
     result |= p_cem102->WEDACConfig(cem102_dut, WE2,
                                     ((DC_DAC_WE2_CTRL_DAC_WE2_VALUE_MASK &
@@ -489,9 +544,9 @@ static int CEM102_ConfigREResidualCurrent(DRIVER_CEM102_t *p_cem102,
     /* RE voltage will be set via AT1 to WE2 voltage (RE voltage while in
      * normal operation)
      */
-    uint16_t sw_conn[2] = { CH1_SC119_SC120_CONNECT,
-                            CH2_SC219_SC220_CONNECT | CH2_SC213_CONNECT
-                          };
+    uint16_t sw_conn[CEM102_NUM_LSADS] = { CH1_SC119_SC120_CONNECT,
+                                           CH2_SC219_SC220_CONNECT | CH2_SC213_CONNECT
+                                         };
     result |= CEM102_ConfigChannelSwitch(p_cem102, CEM102_LSAD_READ_WE1_WE2,
                                         sw_conn);
     return result;
@@ -500,54 +555,58 @@ static int CEM102_ConfigREResidualCurrent(DRIVER_CEM102_t *p_cem102,
 static int CEM102_SetupRECEResidualCurrent(DRIVER_CEM102_t *p_cem102,
                                            CEM102_CurrentData *p_data)
 {
-    int result = p_cem102->REDACConfig(cem102_dut, DAC_RE_DISABLE,
-                                       RE_SR1_CONNECT | RE_SR2_CONNECT,
-                                       RE_BUF_DISABLE);
-    if (result != ERRNO_NO_ERROR)
-    {
-        result = CEM102_ConfigREResidualCurrent(p_cem102, p_data);
-    }
-    return result;
+    CEM102_DisableREDAC(p_cem102, cem102_dut,
+                        CEM102_SW_SR1_POSITION(cem102_dut) |
+                        RE_SR2_CONNECT, RE_BUF_DISABLE);
+    return CEM102_ConfigREResidualCurrent(p_cem102, p_data);
 }
 
 static int CEM102_SetupREResidualCurrent(DRIVER_CEM102_t *p_cem102,
                                          CEM102_CurrentData *p_data)
 {
-    int result = p_cem102->REDACConfig(cem102_dut, DAC_RE_DISABLE,
-                                       RE_SR2_CONNECT, RE_BUF_DISABLE);
-    if (result != ERRNO_NO_ERROR)
-    {
-        result = CEM102_ConfigREResidualCurrent(p_cem102, p_data);
-    }
-    return result;
+    CEM102_DisableREDAC(p_cem102, cem102_dut, RE_SR2_CONNECT,
+                        RE_BUF_DISABLE);
+    return CEM102_ConfigREResidualCurrent(p_cem102, p_data);
 }
 
 static int CEM102_SetupOffsetCurrent(DRIVER_CEM102_t *p_cem102,
                                      CEM102_CurrentData *p_data)
 {
     /* Configure the ADC to prepare for the ChannelOffsetCurrent */
-    uint16_t sw_conn[2] = { CH1_SC119_SC120_CONNECT,
-                            CH2_SC219_SC220_CONNECT
-                          };
+    uint16_t sw_conn[CEM102_NUM_LSADS] = { CH1_SC119_SC120_CONNECT,
+                                           CH2_SC219_SC220_CONNECT
+                                         };
+    CEM102_EnableSingleChannel(p_cem102,
+                               (p_data->lsad_req == CEM102_LSAD_READ_WE2) ?
+                               WE2 : WE1);
     return CEM102_ConfigChannelSwitch(p_cem102, p_data->lsad_req, sw_conn);
 }
 
 static int CEM102_SetupDACVoltage(DRIVER_CEM102_t *p_cem102,
                                   CEM102_CurrentData *p_data)
 {
-    CEM102_DAC_TYPE dac = CEM102_GetChanNumber(p_data->lsad_req);
-
-    int result = p_cem102->SetupADCToMeasureDAC(cem102_dut, dac,
+    int result = p_cem102->SetupADCToMeasureDAC(cem102_dut, p_data->target_dac,
                                                 CEM102_PRE_MEASURE_CONFIG);
     CEM102_AdjustADCGain(p_cem102, p_data);
 
     if (result == ERRNO_NO_ERROR)
     {
-        uint8_t index = dac - 1;
-        uint16_t we_en[3] = { DAC_WE1_ENABLE, DAC_WE2_ENABLE, DAC_RE_ENABLE };
+        uint8_t index = (uint8_t)p_data->target_dac - 1;
+        uint16_t we_en = DAC_WE1_ENABLE; /* Value same for all DACS */
         uint16_t dac_setting = 0;
+        uint16_t calib_v[CEM102_MAX_DACS] = {
+            WE1_DAC_V_USER_SETTING,
+            WE2_DAC_V_USER_SETTING,
+            RE_DAC_V_USER_SETTING
+        };
 
-        result = p_cem102->CalculateDACAmplitude(cem102_dut, dac,
+        /* This logic isn't for the diagnostics */
+        if (diagData.diagreq_saved == 0)
+        {
+            we_en = CEM102_GetDACEnableBit(cem102_dut, p_data->target_dac);
+        }
+
+        result = p_cem102->CalculateDACAmplitude(cem102_dut, p_data->target_dac,
                                                  p_data->target_mv, &dac_setting);
         if (result == ERRNO_GENERAL_FAILURE)
         {
@@ -555,49 +614,61 @@ static int CEM102_SetupDACVoltage(DRIVER_CEM102_t *p_cem102,
             if (p_data->target_mv)
             {
                 val *= (float)p_data->target_mv;
-                val /= (float)WE_DAC_TARGET_MV;
+                val /= (float)calib_v[index];
             }
             dac_setting = (uint16_t)val;
         }
 
         uint16_t dac_v = 0;
-        uint8_t dac_reg[3] = { DC_DAC_WE1_CTRL,
-                               DC_DAC_WE2_CTRL,
-                               DC_DAC_RE_CTRL
-                             };
-        uint16_t ctrl_mask[3] = { DC_DAC_WE1_CTRL_DAC_WE1_VALUE_MASK,
-                                  DC_DAC_WE2_CTRL_DAC_WE2_VALUE_MASK,
-                                  DC_DAC_RE_CTRL_DAC_RE_VALUE_MASK
-                                };
+        uint8_t dac_reg[CEM102_MAX_DACS] = { DC_DAC_WE1_CTRL,
+                                             DC_DAC_WE2_CTRL,
+                                             DC_DAC_RE_CTRL
+                                           };
+        uint16_t ctrl_mask[CEM102_MAX_DACS] = { DC_DAC_WE1_CTRL_DAC_WE1_VALUE_MASK,
+                                                DC_DAC_WE2_CTRL_DAC_WE2_VALUE_MASK,
+                                                DC_DAC_RE_CTRL_DAC_RE_VALUE_MASK
+                                              };
         result = p_cem102->RegisterRead(cem102_dut, dac_reg[index], &dac_v);
         if (result == ERRNO_NO_ERROR)
         {
             uint16_t irq_cfg = DC_DAC_LOAD_IRQ_DISABLE;
 
             dac_v &= ctrl_mask[index];
-            if (dac_v != dac_setting)
+
+            /* If DAC is enabled, we can expect DAC LOAD IRQ interrupt */
+            if ((dac_v != dac_setting) && (we_en != 0))
             {
                 CEM102_SetLSADState(CEM102_LSAD_STATE_DAC_LOADED);
                 CEM102_Enable_DAC_LOAD_IRQ(p_cem102, true);
                 irq_cfg = DC_DAC_LOAD_IRQ_ENABLE;
             }
-            if (dac == RE)
+            if (p_data->target_dac == RE)
             {
-                result |= p_cem102->REDACConfig(cem102_dut, ((ctrl_mask[index] &
-                                                dac_setting) | we_en[index]),
-                                                (RE_SR1_CONNECT | RE_SR2_CONNECT),
-                                                (RE_BUF_ENABLE |
-                                                RE_HP_MODE_DISABLE));
+                p_cem102->REDACConfig(cem102_dut, ((ctrl_mask[index] &
+                                      dac_setting) | we_en),
+                                      (CEM102_SW_SR1_POSITION(cem102_dut) |
+                                      RE_SR2_CONNECT),
+                                      (RE_BUF_ENABLE |
+                                      RE_HP_MODE_DISABLE));
             }
             else
             {
-                result |= p_cem102->WEDACConfig(cem102_dut, (int)dac,
+                result |= p_cem102->WEDACConfig(cem102_dut,
+                                                (int)p_data->target_dac,
                                                 ((ctrl_mask[index] &
-                                                dac_setting) | we_en[index]),
+                                                dac_setting) | we_en),
                                                 irq_cfg);
             }
-            if (dac_v == dac_setting)
+
+            /* When DAC is disabled, we are not getting the DAC_READY event.
+             * Start the measurement now.
+             */
+            if ((dac_v == dac_setting) || (we_en == 0))
             {
+                CEM102_EnableSingleChannel(p_cem102,
+                                           (p_data->target_dac == WE2) ?
+                                           WE2 : WE1);
+
                 /* We can measure without any delay */
                 CEM102_StartMeasurement(p_cem102, SINGLE_CMD);
             }
@@ -616,12 +687,15 @@ static int CEM102_SetupCalibCurrent(DRIVER_CEM102_t *p_cem102,
         chan = WE2;
     }
     CEM102_SetLSADState(CEM102_LSAD_STATE_MEAS_STARTED);
+
+    /* Disable the unused LSAD's measurement */
+    CEM102_ChannelCtrl(p_cem102, (chan == WE2) ? WE1 : WE2, false);
     return p_cem102->MeasureReference(cem102_dut, chan);
 }
 
 static void CEM102_MeasureWithLSAD(DRIVER_CEM102_t *p_cem102,
                                    CEM102_CurrentData *p_data,
-                                   uint16_t diagmask)
+                                   uint16_t diagmask, uint16_t *p_req)
 {
     int result = ERRNO_NO_ERROR;
 
@@ -648,12 +722,15 @@ static void CEM102_MeasureWithLSAD(DRIVER_CEM102_t *p_cem102,
             if ((result == ERRNO_NO_ERROR) && (!diagData.setup_changes_states))
             {
                 /* We expect LSAD to be idle after calibration */
+                CEM102_EnableSingleChannel(p_cem102,
+                                           (p_data->lsad_req == CEM102_LSAD_READ_WE2) ?
+                                           WE2 : WE1);
                 result = CEM102_StartMeasurement(p_cem102, SINGLE_DELAY_CMD);
             }
             if (result != ERRNO_NO_ERROR)
             {
                 /* Error. Restore the registers if needed before bailing out */
-                CEM102_LSADRestoreState(p_cem102, p_data, diagmask);
+                CEM102_LSADRestoreState(p_cem102, p_data, diagmask, p_req);
             }
             break;
         }
@@ -664,6 +741,9 @@ static void CEM102_MeasureWithLSAD(DRIVER_CEM102_t *p_cem102,
         case CEM102_LSAD_STATE_DAC_READY:
         {
             CEM102_Enable_DAC_LOAD_IRQ(p_cem102, false);
+            CEM102_EnableSingleChannel(p_cem102,
+                                       (p_data->lsad_req == CEM102_LSAD_READ_WE2) ?
+                                       WE2 : WE1);
 
             /* DAC may be just loaded. Measuring with some delay */
             CEM102_StartMeasurement(p_cem102, SINGLE_DELAY_CMD);
@@ -683,7 +763,7 @@ static void CEM102_MeasureWithLSAD(DRIVER_CEM102_t *p_cem102,
                     if ((sysstatus & mask) == mask)
                     {
                         CEM102_SetLSADState(CEM102_LSAD_STATE_DATA_REQUESTED);
-                        memset(measure_buf, 0, sizeof(measure_buf));
+                        memset(demo_measure_buf, 0, sizeof(demo_measure_buf));
                         result = p_cem102->QueueRead(cem102_dut,
                                                      SYS_BUFFER_WORD0,
                                                      MEASUREMENT_LENGTH);
@@ -693,15 +773,15 @@ static void CEM102_MeasureWithLSAD(DRIVER_CEM102_t *p_cem102,
             if (result != ERRNO_NO_ERROR)
             {
                 /* Bail out on error */
-                CEM102_LSADRestoreState(p_cem102, p_data, diagmask);
+                CEM102_LSADRestoreState(p_cem102, p_data, diagmask, p_req);
             }
             break;
         }
         case CEM102_LSAD_STATE_DATA_AVAILABLE:
         {
-            p_cem102->RegisterBufferRead(cem102_dut, measure_buf,
+            p_cem102->RegisterBufferRead(cem102_dut, demo_measure_buf,
                                        MEASUREMENT_LENGTH);
-            CEM102_LSADRestoreState(p_cem102, p_data, diagmask);
+            CEM102_LSADRestoreState(p_cem102, p_data, diagmask, p_req);
             break;
         }
         case CEM102_LSAD_STATE_REINIT:
@@ -716,7 +796,7 @@ static void CEM102_MeasureWithLSAD(DRIVER_CEM102_t *p_cem102,
     }
 }
 
-static void CEM102_UpdateCalibCurrentRatio(DRIVER_CEM102_t *p_cem102)
+static void CEM102_UpdateCalibCurrentRatio(DRIVER_CEM102_t *p_cem102, uint16_t *p_req)
 {
     uint32_t ibp = 0;
     uint32_t ibn = 0;
@@ -735,11 +815,11 @@ static void CEM102_UpdateCalibCurrentRatio(DRIVER_CEM102_t *p_cem102)
         cem102_diag_func_char.cal_curr_ratio =
                 App_Utils_ConvertFloatToUInt32(curr_measured / curr_from_otp);
 #if SWMTRACE_OUTPUT
-        swmLogInfo("CalibCurrRatio(%f/%f=%f)\r\n", curr_measured,
-                   curr_from_otp, curr_measured / curr_from_otp);
+        swmLogInfo("\rCalibration current ratio:,%f\r\n",
+                   curr_measured / curr_from_otp);
 #endif /* SWMTRACE_OUTPUT */
     }
-    diagData.diagreq &= ~CEM102_DIAG_CAL_CURR_RATIO;
+    (*p_req) &= ~CEM102_DIAG_CAL_CURR_RATIO;
 }
 
 static void CEM102_InitRegsToSaveForDacVolt(CEM102_CurrentData *p_data)
@@ -755,6 +835,7 @@ static void CEM102_InitRegsToSaveForDacVolt(CEM102_CurrentData *p_data)
             p_data->valid_regs |= (REG_CHCFG_CH2_LSAD_SAVE |
                                    REG_CHCFG_CH2_THRESHOLD_SAVE |
                                    REG_CHCFG_CH2_BUFFER_SAVE |
+                                   REG_CHCFG_CH1_ACCUM_SAVE |
                                    REG_CHCFG_CH2_ACCUM_SAVE |
                                    REG_DC_DAC_WE2_CTRL_SAVE
                                   );
@@ -770,6 +851,7 @@ static void CEM102_InitRegsToSaveForDacVolt(CEM102_CurrentData *p_data)
                                    REG_CHCFG_CH1_THRESHOLD_SAVE |
                                    REG_CHCFG_CH1_BUFFER_SAVE |
                                    REG_CHCFG_CH1_ACCUM_SAVE |
+                                   REG_CHCFG_CH2_ACCUM_SAVE |
                                    REG_DC_DAC_WE1_CTRL_SAVE
                                   );
             break;
@@ -798,10 +880,12 @@ static void CEM102_SetElectrodeInputs(DRIVER_CEM102_t *p_cem102, bool connect)
 static void CEM102_DiagnosticsInit(DRIVER_CEM102_t *p_cem102)
 {
     if (diagData.lsad_state == CEM102_LSAD_STATE_REINIT ||
-        diagData.p_saved_data != &saved_regs)
+        diagData.p_saved_data != &diagData.saved_data)
     {
-        diagData.p_saved_data = &saved_regs;
-        diagData.lsad_state = CEM102_LSAD_STATE_SETUP;
+        /* On STATE_REINIT, clear apireq which may or may not be 0 */
+        diagData.apireq = 0;
+        diagData.p_saved_data = &diagData.saved_data;
+        CEM102_SetLSADState(CEM102_LSAD_STATE_SETUP);
         diagData.regs_saved = false;
         diagData.diagreq = CEM102_DIAG_REQUESTS;
         diagData.diagreq_saved = diagData.diagreq;
@@ -810,7 +894,14 @@ static void CEM102_DiagnosticsInit(DRIVER_CEM102_t *p_cem102)
         {
             if (calib_ref_measurement == 0)
             {
-                diagData.diagreq |= CEM102_CALIB_CURRRENT;
+                diagData.diagreq |= CEM102_CALIB_CURRENT;
+
+                /* Since calibration current measured here, it
+                 * won't/need not be measured while handling "apireq".
+                 * Setting it here as completed.
+                 */
+                APP_SetMeasureTimerEvent(cem102_dut,
+                                         MEAS_TIMER_OK_TO_RUN_DIAGAPI);
             }
 
             /* Disconnect WE1 & WE2 before starting diagnostics */
@@ -820,6 +911,11 @@ static void CEM102_DiagnosticsInit(DRIVER_CEM102_t *p_cem102)
              * already measuring.
              */
             CEM102_SendCommand(p_cem102, IDLE_CMD);
+        }
+        else
+        {
+            APP_SetMeasureTimerEvent(cem102_dut,
+                                     MEAS_TIMER_OK_TO_RUN_DIAGNOSTICS);
         }
     }
 }
@@ -834,18 +930,15 @@ CEM102_LSAD_STATE CEM102_GetLSADState(void)
     return diagData.lsad_state;
 }
 
-#endif /* CEM102_DIAG_FUNCTIONS */
-
-static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
+static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102, uint16_t *p_req)
 {
-#if CEM102_DIAG_FUNCTIONS
     /* Initialize, if not done already. */
     CEM102_DiagnosticsInit(p_cem102);
 
     uint16_t diagmask = 0;
     for (uint16_t idx = 0; idx < CEM102_DIAG_NUM_REQUESTS; idx++)
     {
-        if (diagData.diagreq & (1U << idx))
+        if ((*p_req) & (1U << idx))
         {
             diagmask = (1U << idx);
             break;
@@ -861,7 +954,7 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
 
     switch (diagmask)
     {
-        case CEM102_CALIB_CURRRENT:
+        case CEM102_CALIB_CURRENT:
         {
 
             data.valid_regs = REG_ANA_CFG0_SAVE | REG_ANA_CFG1_SAVE |
@@ -895,12 +988,12 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
             data.lsad_req = CEM102_LSAD_READ_WE1;
             data.setup_callback = CEM102_SetupCalibCurrent;
             data.result_callback = CEM102_ResultCalibCurrent;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
             break;
         }
         case CEM102_DIAG_CAL_CURR_RATIO:
         {
-            CEM102_UpdateCalibCurrentRatio(p_cem102);
+            CEM102_UpdateCalibCurrentRatio(p_cem102, p_req);
             break;
         }
         case CEM102_DIAG_WE1_OFF_CURR:
@@ -909,7 +1002,7 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
             data.lsad_req = CEM102_LSAD_READ_WE1;
             data.setup_callback = CEM102_SetupOffsetCurrent;
             data.result_callback = CEM102_ResultOffsetCurrent;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
             break;
         }
         case CEM102_DIAG_WE2_OFF_CURR:
@@ -918,40 +1011,46 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
             data.lsad_req = CEM102_LSAD_READ_WE2;
             data.setup_callback = CEM102_SetupOffsetCurrent;
             data.result_callback = CEM102_ResultOffsetCurrent;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
             break;
         }
         case CEM102_DIAG_WE1_DAC_VOLT:
         {
+            /* To be consistent, voltage measurement uses LSAD2 */
             data.lsad_req = CEM102_LSAD_READ_WE1;
-            data.target_mv = WE_DAC_TARGET_MV;
+            data.target_dac = WE1;
+            data.target_mv = WE1_DAC_V_USER_SETTING;
             diagData.setup_changes_states = true;
             CEM102_InitRegsToSaveForDacVolt(&data);
             data.setup_callback = CEM102_SetupDACVoltage;
             data.result_callback = CEM102_ResultDACVoltage;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
             break;
         }
         case CEM102_DIAG_WE2_DAC_VOLT:
         {
+            /* To be consistent, voltage measurement uses LSAD2 */
             data.lsad_req = CEM102_LSAD_READ_WE2;
-            data.target_mv = WE_DAC_TARGET_MV;
+            data.target_dac = WE2;
+            data.target_mv = WE2_DAC_V_USER_SETTING;
             diagData.setup_changes_states = true;
             CEM102_InitRegsToSaveForDacVolt(&data);
             data.setup_callback = CEM102_SetupDACVoltage;
             data.result_callback = CEM102_ResultDACVoltage;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
             break;
         }
         case CEM102_DIAG_RE_DAC_VOLT:
         {
-            data.lsad_req = CEM102_LSAD_READ_RE;
-            data.target_mv = WE_DAC_TARGET_MV;
+            /* To be consistent, voltage measurement uses LSAD2 */
+            data.lsad_req = CEM102_LSAD_READ_WE1;
+            data.target_dac = RE;
+            data.target_mv = RE_DAC_V_USER_SETTING;
             diagData.setup_changes_states = true;
             CEM102_InitRegsToSaveForDacVolt(&data);
             data.setup_callback = CEM102_SetupDACVoltage;
             data.result_callback = CEM102_ResultDACVoltage;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
             break;
         }
         case CEM102_DIAG_AT1_RES_CURR:
@@ -966,7 +1065,7 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
             data.lsad_req = CEM102_LSAD_READ_WE1;
             data.setup_callback = CEM102_SetupATResidualCurrent;
             data.result_callback = CEM102_ResultATResidualCurrent;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
 
             break;
         }
@@ -982,7 +1081,7 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
             data.lsad_req = CEM102_LSAD_READ_WE2;
             data.setup_callback = CEM102_SetupATResidualCurrent;
             data.result_callback = CEM102_ResultATResidualCurrent;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
             break;
         }
         case CEM102_DIAG_WE1_RES_CURR:
@@ -992,7 +1091,7 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
             data.lsad_req = CEM102_LSAD_READ_WE1;
             data.setup_callback = CEM102_SetupResidualCurrent;
             data.result_callback = CEM102_ResultResidualCurrent;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
             break;
         }
         case CEM102_DIAG_WE2_RES_CURR:
@@ -1002,7 +1101,7 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
             data.lsad_req = CEM102_LSAD_READ_WE2;
             data.setup_callback = CEM102_SetupResidualCurrent;
             data.result_callback = CEM102_ResultResidualCurrent;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
             break;
         }
         case CEM102_DIAG_RE_RES_CURR:
@@ -1018,10 +1117,10 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
 
             /* Channel number is irrelevant. Code always use WE2 */
             data.lsad_req = CEM102_LSAD_READ_WE2;
-            data.target_mv = WE_DAC_TARGET_MV;
+            data.target_mv = RE_DAC_V_USER_SETTING;
             data.setup_callback = CEM102_SetupREResidualCurrent;
             data.result_callback = CEM102_ResultREResidualCurrent;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
 
             break;
         }
@@ -1036,10 +1135,10 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
                               REG_DC_DAC_WE2_CTRL_SAVE |
                               REG_SYSCTRL_IRQ_CFG_SAVE;
             data.lsad_req = CEM102_LSAD_READ_WE2;
-            data.target_mv = WE_DAC_TARGET_MV;
+            data.target_mv = RE_DAC_V_USER_SETTING;
             data.setup_callback = CEM102_SetupRECEResidualCurrent;
             data.result_callback = CEM102_ResultRECEResidualCurrent;
-            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask);
+            CEM102_MeasureWithLSAD(p_cem102, &data, diagmask, p_req);
             break;
         }
         default:
@@ -1047,35 +1146,26 @@ static void CEM102_DiagnosticsInternal(DRIVER_CEM102_t *p_cem102)
             break;
         }
     }
-
-    if (CEM102_DiagnosticsDone(p_cem102))
-    {
-        /* Clear all the events return in a clean state, in IDLE mode, the same
-         * way we entered the diagnostics mode.
-         */
-        CEM102_SendCommand(p_cem102, IDLE_CMD);
-    }
-#endif /* CEM102_DIAG_FUNCTIONS */
 }
+#endif /* CEM102_DIAG_FUNCTIONS */
 
 /* Should be called only when CEM102_DiagnosticsDone returns false.  */
 void CEM102_Diagnostics(DRIVER_CEM102_t *p_cem102)
 {
-#if SWMTRACE_OUTPUT
-    uint8_t loop = 0;
-#endif /* SWMTRACE_OUTPUT */
-
+#if CEM102_DIAG_FUNCTIONS
     do
     {
-#if SWMTRACE_OUTPUT
-        if (++loop > 1)
+        CEM102_DiagnosticsInternal(p_cem102, &diagData.diagreq);
+        if (CEM102_DiagnosticsDone(p_cem102))
         {
-            swmLogInfo("Calling again(%d)\r\n", loop);
+            /* Clear all the events return in a clean state, in IDLE mode, the same
+             * way we entered the diagnostics mode.
+             */
+            CEM102_SendCommand(p_cem102, IDLE_CMD);
         }
-#endif /* SWMTRACE_OUTPUT */
-        CEM102_DiagnosticsInternal(p_cem102);
     } while ((!CEM102_DiagnosticsDone(p_cem102)) &&
            (CEM102_GetLSADState() == CEM102_LSAD_STATE_SETUP));
+#endif /* CEM102_DIAG_FUNCTIONS */
 }
 
 bool CEM102_DiagnosticsDone(DRIVER_CEM102_t *p_cem102)
@@ -1096,9 +1186,103 @@ bool CEM102_DiagnosticsDone(DRIVER_CEM102_t *p_cem102)
 
             /* Connect WE1 & WE2 back as diagnostics is over. */
             CEM102_SetElectrodeInputs(p_cem102, true);
+            APP_SetMeasureTimerEvent(cem102_dut,
+                                     MEAS_TIMER_OK_TO_RUN_DIAGNOSTICS);
         }
     }
 #endif /* CEM102_DIAG_FUNCTIONS */
     return result;
+}
+
+const char *CEM102_GetDACName(CEM102_DAC_TYPE dac)
+{
+    const char *p;
+    if (dac == WE2)
+    {
+        p = "WE2";
+    }
+    else if (dac == RE)
+    {
+        p = "RE";
+    }
+    else
+    {
+        p = "WE1";
+    }
+    return p;
+}
+
+void CEM102_DiagnosticsAPIInit(DRIVER_CEM102_t *p_cem102, const CEM102_Device *p_dev)
+{
+#if CEM102_DIAG_FUNCTIONS
+    diagData.p_saved_data = &diagData.saved_data;
+    CEM102_SetLSADState(CEM102_LSAD_STATE_SETUP);
+    diagData.regs_saved = false;
+    diagData.apireq = 0;
+    if (CEM102_MEAS_WE1_VOLTAGE(p_dev))
+    {
+       diagData.apireq |= CEM102_DIAG_WE1_DAC_VOLT;
+    }
+    if (CEM102_MEAS_WE2_VOLTAGE(p_dev))
+    {
+       diagData.apireq |= CEM102_DIAG_WE2_DAC_VOLT;
+    }
+    if (CEM102_MEAS_RE_VOLTAGE(p_dev))
+    {
+       diagData.apireq |= CEM102_DIAG_RE_DAC_VOLT;
+    }
+
+    if (diagData.apireq != 0)
+    {
+        if (calib_ref_measurement == 0)
+        {
+            diagData.apireq |= CEM102_CALIB_CURRENT;
+        }
+
+        /* Clear any existing events & go to IDLE mode in case LSAD is
+         * already measuring.
+         */
+        CEM102_SendCommand(p_cem102, IDLE_CMD);
+    }
+    else
+    {
+        APP_SetMeasureTimerEvent(p_dev, MEAS_TIMER_OK_TO_RUN_DIAGAPI);
+    }
+
+    /* Call once to kick start the measurement */
+    CEM102_DiagnosticsAPI(p_cem102, p_dev);
+#endif /* CEM102_DIAG_FUNCTIONS */
+}
+
+bool CEM102_DiagnosticsAPIDone(DRIVER_CEM102_t *p_cem102, const CEM102_Device *p_dev)
+{
+    bool result = true;
+
+#if CEM102_DIAG_FUNCTIONS
+    if (diagData.apireq)
+    {
+        result = false;
+    }
+#endif /* CEM102_DIAG_FUNCTIONS */
+    return result;
+}
+
+void CEM102_DiagnosticsAPI(DRIVER_CEM102_t *p_cem102, const CEM102_Device *p_dev)
+{
+#if CEM102_DIAG_FUNCTIONS
+    bool done = false;
+    do
+    {
+        CEM102_DiagnosticsInternal(p_cem102, &diagData.apireq);
+        done = CEM102_DiagnosticsAPIDone(p_cem102, p_dev);
+        if (done)
+        {
+            /* Clear all the events return in a clean state, in IDLE mode, the same
+             * way we entered the diagnostics mode.
+             */
+            CEM102_SendCommand(p_cem102, IDLE_CMD);
+        }
+    } while ((!done) && (CEM102_GetLSADState() == CEM102_LSAD_STATE_SETUP));
+#endif /* CEM102_DIAG_FUNCTIONS */
 }
 

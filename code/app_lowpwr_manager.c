@@ -16,6 +16,7 @@
 
 #include "app.h"
 #include "app_customss.h"
+#include "app_button.h"
 
 LowPowerModeCfg_t mem_retention_sleep_mode_cfg;
 LowPowerModeCfg_t no_retention_sleep_mode_cfg;
